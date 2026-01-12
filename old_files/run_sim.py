@@ -5,7 +5,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 import flwr as fl
 from model import Net
-from client import FlowerClient
+from client import FedClient
 from utils import mseFedAvg
 from pathlib import Path
 from server import server
@@ -14,8 +14,8 @@ DATA_DIR = Path(__file__).resolve().parent / "data"   # absolute path
 #artificial data scarcity
 NUM_CLIENTS = 100
 POP=NUM_CLIENTS+1
-def client_fn(cid: str) -> FlowerClient:
-    return FlowerClient(int(cid), num_partitions=POP, local_epochs=LOCAL_EPOCHS, batch_size=BATCH_SIZE).to_client()
+def client_fn(cid: str) -> FedClient:
+    return FedClient(int(cid), num_partitions=POP, local_epochs=LOCAL_EPOCHS, batch_size=BATCH_SIZE).to_client()
 
 def fit_config_factory(pre_rounds: int):
     def fit_config(server_round: int):
@@ -35,7 +35,7 @@ sel_rounds=3
 if __name__ == "__main__":
     base=server(NUM_CLIENTS, BATCH_SIZE, 40)
     base.fit()
-    init_params = fl.common.ndarrays_to_parameters(FlowerClient.get_weights(Net()))
+    init_params = fl.common.ndarrays_to_parameters(FedClient.get_weights(Net()))
     strategy = mseFedAvg(
         topk=TOPK,                     # make sure TOPK <= NUM_CLIENTS
         selection_rounds=sel_rounds,

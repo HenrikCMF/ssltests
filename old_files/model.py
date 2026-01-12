@@ -15,6 +15,7 @@ import architectures
 import classifier_heads
 from torchvision import datasets, transforms, models
 import save_model
+import time
 DATA_DIR = Path(__file__).resolve().parent / "data"   # absolute path
 
 class TwoViews(torch.utils.data.Dataset):
@@ -137,7 +138,7 @@ class Do_SSL:
                     t = (ep-warmup)/max(1,T-warmup)
                     lr = 1e-5 + 0.5*(1e-3-1e-5)*(1+np.cos(np.pi*t))
                 for g in opt.param_groups: g['lr'] = lr
-
+            start=time.time()
             for ep in range(1, T+1):
                 set_lr(ep)
                 total=0.0

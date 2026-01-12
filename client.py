@@ -5,11 +5,12 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import numpy as np
 import torch
 import flwr as fl
-from model import Net,Autoencoder, ML_functions, VQVAE
 import random
 import json
 from pathlib import Path
-from utils import vqvae_utils
+from dataloader import CIFAR10BYOLClientData
+from architectures import ResNet18Projv2
+from SSL import SimpleBYOL
 DATA_DIR = Path(__file__).resolve().parent / "data"   # absolute path
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -21,75 +22,77 @@ def get_device() -> torch.device:
 DEVICE = get_device()
 
 
-class FlowerClient(fl.client.NumPyClient, ML_functions):
+class FedClient(fl.client.NumPyClient):
     def __init__(self, cid: int, num_partitions: int, local_epochs: int, batch_size: int):
-        self.embedding_size=512
+        self.weight_storage="local_weights/"
+        self.embedding_size=128
         self.cid = int(cid)
-        self.num_classes = 10
-        self.n_classes=1
-        self.noise_level = int(round(100 * (self.cid % num_partitions) / max(1, (num_partitions - 1))))
-        rng = random.Random(self.cid)
-        self.classes=rng.sample(range(self.num_classes), self.n_classes)
-        self.classes_json=json.dumps([int(c) for c in self.classes])
-        self.net = Net()
-        self.trainloader, self.valloader = self.simple_load_data(self.cid, num_partitions, batch_size, self.noise_level, self.classes)
+        self.target_path=self.weight_storage+"target"+str(self.cid)+".pt"
+        self.EMA=ResNet18Projv2(self.embedding_size)
+        self.model=ResNet18Projv2(self.embedding_size)
         self.local_epochs = local_epochs
-        
-        self.counts = torch.zeros(self.num_classes, dtype=torch.long)
-
-    def test_local_data(self, num_samples: int, roundnum:int) -> float:
-        # Use an absolute path to avoid CWD issues
-        base_dir = Path(__file__).resolve().parent
-        #model_path = "model"+str(roundnum)+".pth"
-        model_path = "model"+".pth"
-        ae_path = base_dir / model_path
-        autoenc = VQVAE(dim=3, n_h=64, e_dim=32, n_embed=self.embedding_size,decay=0.99)
-        state = torch.load(ae_path, map_location=DEVICE)   # ae_path = base_dir / "model.pth"
-        autoenc.load_state_dict(state, strict=True)
-        autoenc.eval()
-        #return autoenc.recon_error_random_eval(self.trainloader, num_samples)
-        hist= autoenc.code_histogram_random_eval(self.trainloader, num_samples, dp_sigma=0, clip_count=500.0)
-        p_i = hist.cpu().numpy()                  # <<< convert here
-        p_t = np.load(f"hist_class_{roundnum}.npy") # already numpy
-        sim01 = 1.0 - vqvae_utils.js_divergence(p_i, p_t) / np.log(2.0)
-        return float(sim01)
-
-    def get_parameters(self, config):
-        return self.get_weights(self.net)
+        data_obj = CIFAR10BYOLClientData(
+        num_clients=num_partitions,
+        cid=self.cid,
+        batch_size=128,
+        keep_labels=False,
+        data_dir="./data",
+        seed=12345,
+        device=DEVICE
+        )
+        self.global_ema_decay = 0.996
+        self.SSL_trainer = SimpleBYOL(
+            online_encoder=self.model,
+            target_encoder=self.EMA,
+            emb_dim=128,
+            lr=3e-4,
+            moving_average_decay=0.996,
+            use_ema=True,        )
+        self.train_loader, self.val_loader = data_obj.get_loaders()
 
     def fit(self, parameters, config):
-        #if config.get("phase") == "init":
-        phase = config.get("phase", "train")
-        if phase != "train":
-            mse = self.test_local_data(100, roundnum=phase)
-            return self.get_weights(self.net), 100, {"quality": mse, "noise_level": float(self.noise_level), "classes": self.classes_json}
-        self.set_weights(self.net, parameters)
-        train_loss, self.counts = self.net.train_one_round(self.net, self.trainloader, epochs=self.local_epochs, tar_counter=self.counts)
-        return self.get_weights(self.net), len(self.trainloader.dataset), {"train_loss": train_loss, "noise_level": float(self.noise_level)}
+        self.model.set_parameters(parameters)
+        FFC=self.load_local()
+        self._ema_target_with_global(parameters, decay=0.7)
+        train_loss= self.SSL_trainer.train(self.train_loader, epochs=self.local_epochs)
+        self.save_local()
+        print(self.cid,train_loss)
+        return self.model.get_parameters(), len(self.train_loader.dataset), {"train_loss": train_loss}
 
     def evaluate(self, parameters, config):
-        self.set_weights(self.net, parameters)
-        loss, acc = self.validate(self.net, self.valloader)
-        return loss, len(self.valloader.dataset), {"accuracy": acc}
+        self.model.set_parameters(parameters)
+        return 0.0, len(self.val_loader.dataset), {"accuracy": 0.0}
+    
+
+    def _ema_target_with_global(self, global_parameters, decay: float = None):
+        """
+        EMA_target = decay * EMA_target_old + (1 - decay) * global_model
+        """
+        if decay is None:
+            decay = self.global_ema_decay
+
+        device = next(self.EMA.parameters()).device
+        global_tensors = [torch.from_numpy(p).to(device) for p in global_parameters]
+
+        with torch.no_grad():
+            for ema_param, global_param in zip(self.EMA.parameters(), global_tensors):
+                ema_param.mul_(decay).add_(global_param, alpha=1.0 - decay)
+
+    def get_weights(self):
+        return self.model.get_parameters()
+    
+    def load_local(self):
+        try:
+            self.EMA.load_state_dict(torch.load(self.target_path, map_location=DEVICE))
+            return True
+        except:
+            return False
+
+    def save_local(self):
+        torch.save(self.EMA.state_dict(), self.target_path)
     
 
 
-
-"""""
-Data evenness metric
-N = self.counts.sum()
-p = self.counts / N
-p = p[p > 0]
-H = -(p * p.log()).sum()
-J = H / torch.log(torch.tensor(len(self.counts), dtype=torch.float))
-
-self.set_weights(self.net, parameters)
-before=np.concatenate([p.ravel() for p in self.get_weights(self.net)])
-train_loss, self.counts = self.train_one_round(self.net, self.trainloader, epochs=self.local_epochs, tar_counter=self.counts)
-after=np.concatenate([p.ravel() for p in self.get_weights(self.net)])
-euclidean = np.linalg.norm(after - before)
-relative  = euclidean / np.linalg.norm(before)
-return self.get_weights(self.net), len(self.trainloader.dataset), {"train_loss": train_loss, "shannon":1/train_loss}
-
-
-"""""
+if __name__=="__main__":
+    clinet=FedClient(1,2,3,64)
+    clinet.fit(None, None)
