@@ -31,7 +31,6 @@ class SimpleBYOL:
         else:
             device="cpu"
         self.device=device
-
         # Store encoders
         self.online_encoder = online_encoder.to(self.device)
         self.target_encoder = target_encoder.to(self.device)
@@ -140,3 +139,17 @@ class SimpleBYOL:
         # After training, the updated model is self.online_encoder
         return avg_loss
     
+if __name__ == "__main__":
+    # Example usage
+    online_net = models.resnet18(num_classes=128)
+    target_net = models.resnet18(num_classes=128)
+    byol_trainer = SimpleBYOL(online_net, target_net, emb_dim=128, device=None)
+
+    # Dummy dataloader
+    from torch.utils.data import DataLoader, TensorDataset
+    x_dummy = torch.randn(100, 3, 224, 224)
+    dataset = TensorDataset(x_dummy, x_dummy)  # Just dummy data
+    dataloader = DataLoader(dataset, batch_size=16)
+
+    loss = byol_trainer.train(dataloader, epochs=1)
+    print(f"Training loss: {loss}")

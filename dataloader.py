@@ -187,8 +187,10 @@ class CIFAR10BYOLClientData:
             batch_size=self.batch_size,
             shuffle=True,            # local shuffle within the client's shard
             num_workers=self.num_workers,
+            persistent_workers=True,
             pin_memory=self.pin_memory,
             drop_last=True,
+            prefetch_factor=4,
         )
 
         val_loader = DataLoader(

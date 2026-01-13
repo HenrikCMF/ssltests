@@ -21,7 +21,6 @@ def get_device() -> torch.device:
 
 DEVICE = get_device()
 
-
 class FedClient(fl.client.NumPyClient):
     def __init__(self, cid: int, num_partitions: int, local_epochs: int, batch_size: int):
         self.weight_storage="local_weights/"
@@ -36,7 +35,8 @@ class FedClient(fl.client.NumPyClient):
         data_obj = CIFAR10BYOLClientData(
         num_clients=num_partitions,
         cid=self.cid,
-        batch_size=128,
+        batch_size=batch_size,
+        num_workers=5,
         keep_labels=False,
         data_dir="./data",
         seed=12345,
@@ -78,7 +78,7 @@ class FedClient(fl.client.NumPyClient):
         train_loss= self.SSL_trainer.train(self.train_loader, epochs=self.local_epochs)
         #self.SSL_trainer.
         self.save_local()
-        print(self.cid,train_loss)
+        #print(self.cid,train_loss)
         return self.get_federated_parameters(), len(self.train_loader.dataset), {"train_loss": train_loss}
 
 
@@ -161,5 +161,6 @@ class FedClient(fl.client.NumPyClient):
 
 
 if __name__=="__main__":
-    clinet=FedClient(1,2,3,64)
-    clinet.fit(None, None)
+    #clinet=FedClient(1,2,3,64)
+    #clinet.fit(None, None)
+    pass
