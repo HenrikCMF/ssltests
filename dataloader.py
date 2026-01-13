@@ -208,6 +208,20 @@ class CIFAR10BYOLClientData:
         """
         return self.train_loader, self.val_loader
 
+def build_eval_loaders(data_dir="./data", batch_size=512, num_workers=2):
+    tfm = T.Compose([
+        T.Resize(32),
+        T.CenterCrop(32),
+        T.ToTensor(),
+        T.Normalize(mean=(0.4914, 0.4822, 0.4465),
+                    std=(0.2470, 0.2435, 0.2616)),
+    ])
+    train_ds = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
+    test_ds  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=tfm)
+    train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_ld  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    return train_ld, test_ld
+
 
 if __name__ == "__main__":
     data_obj = CIFAR10BYOLClientData(

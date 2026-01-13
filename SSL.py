@@ -19,7 +19,7 @@ class SimpleBYOL:
         online_encoder: nn.Module,
         target_encoder: nn.Module,
         emb_dim: int,
-        lr: float = 3e-4,
+        lr: float = 0.032,
         moving_average_decay: float = 0.996,
         device: str = None,
         use_ema: bool = True,
@@ -91,7 +91,7 @@ class SimpleBYOL:
         """
         self.online_encoder.train()
         self.predictor.train()
-        self.target_encoder.eval()  # no gradients / BN updates
+        #self.target_encoder.eval()  # no gradients / BN updates
 
         for epoch in range(epochs):
             total_loss = 0.0
@@ -139,3 +139,4 @@ class SimpleBYOL:
 
         # After training, the updated model is self.online_encoder
         return avg_loss
+    

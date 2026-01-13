@@ -2,6 +2,8 @@ import flwr as fl
 from client import FedClient
 import shutil
 from pathlib import Path
+import torch
+from eval import FedAvgWithKnnEval
 NUM_CLIENTS   = 5      # how many simulated FL clients
 NUM_ROUNDS    = 10      # how many FedAvg rounds
 LOCAL_EPOCHS  = 1      # BYOL epochs per round per client
@@ -17,11 +19,13 @@ def client_fn(cid: str) -> fl.client.NumPyClient:
     )
 
 if __name__ == "__main__":
-    strategy = fl.server.strategy.FedAvg(
+    strategy = FedAvgWithKnnEval(
         fraction_fit=1.0,
         fraction_evaluate=0.0,
         min_fit_clients=NUM_CLIENTS,
         min_available_clients=NUM_CLIENTS,
+        data_dir="./data",
+        device="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
     )
 
     fl.simulation.start_simulation(
