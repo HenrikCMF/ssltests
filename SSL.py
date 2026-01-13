@@ -23,6 +23,8 @@ class SimpleBYOL:
         moving_average_decay: float = 0.996,
         device: str = None,
         use_ema: bool = True,
+        local_epochs: int = 1,
+        dataset_len: int = 0,
     ):
         if torch.cuda.is_available():
             device="cuda"
@@ -41,17 +43,29 @@ class SimpleBYOL:
 
         # Predictor head q_θ on top of online encoder output
         self.predictor = nn.Sequential(
-            nn.Linear(emb_dim, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(emb_dim, 4096),
+            nn.BatchNorm1d(4096),
             nn.ReLU(inplace=True),
-            nn.Linear(512, emb_dim),
+            nn.Linear(4096, 2048),
         ).to(self.device)
 
+
         # Optimizer updates online encoder + predictor only
-        self.optimizer = torch.optim.Adam(
+        #self.optimizer = torch.optim.Adam(
+        #    list(self.online_encoder.parameters()) + list(self.predictor.parameters()),lr=lr,)
+        self.optimizer = torch.optim.SGD(
             list(self.online_encoder.parameters()) + list(self.predictor.parameters()),
-            lr=lr,
+            lr=0.032,
+            momentum=0.9,
+            weight_decay=1e-4,
         )
+
+        # cosine over total steps
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=max(1, local_epochs * dataset_len),
+        )
+
 
         self.m = moving_average_decay
         self.use_ema = use_ema
@@ -90,7 +104,7 @@ class SimpleBYOL:
         """
         self.online_encoder.train()
         self.predictor.train()
-        #self.target_encoder.eval()  # no gradients / BN updates
+        self.target_encoder.eval()  # no gradients / BN updates
 
         for epoch in range(epochs):
             total_loss = 0.0
@@ -127,6 +141,7 @@ class SimpleBYOL:
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                self.scheduler.step()
 
                 # EMA update of target from online (no gradient)
                 self._update_target()

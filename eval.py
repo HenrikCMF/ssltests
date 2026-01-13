@@ -6,33 +6,17 @@ from architectures import ResNet18Projv2
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
 from dataloader import build_eval_loaders
-@torch.no_grad()
-def extract_feats(encoder, loader, device):
-    encoder.eval()
-    feats, labels = [], []
-    for x, y in loader:
-        x = x.to(device)
-        z = encoder.encode_backbone(x, normalize=True)  # [B,512], normalized
-        feats.append(z.cpu())
-        labels.append(y)
-    return torch.cat(feats, 0), torch.cat(labels, 0)
+import numpy as np
+from typing import List
 
-@torch.no_grad()
-def knn_acc(train_feats, train_labels, test_feats, test_labels, k=200, temperature=0.1):
-    # cosine sim because features are L2-normalized
-    sims = test_feats @ train_feats.T                    # [Ntest, Ntrain]
-    topk_sims, topk_idx = sims.topk(k=k, dim=1)
-    topk_labels = train_labels[topk_idx]
+def l2_norm_between(a: List[np.ndarray], b: List[np.ndarray]) -> float:
+    """Compute ||a - b||_2 across a list of parameter tensors."""
+    s = 0.0
+    for ai, bi in zip(a, b):
+        diff = ai.astype(np.float64) - bi.astype(np.float64)
+        s += float(np.sum(diff * diff))
+    return float(np.sqrt(s))
 
-    weights = torch.exp(topk_sims / temperature)
-    num_classes = int(train_labels.max().item()) + 1
-
-    votes = torch.zeros(test_feats.size(0), num_classes)
-    for c in range(num_classes):
-        votes[:, c] = (weights * (topk_labels == c).float()).sum(dim=1)
-
-    pred = votes.argmax(dim=1)
-    return (pred == test_labels).float().mean().item()
 
 
 
@@ -60,23 +44,31 @@ class FedAvgWithKnnEval(fl.server.strategy.FedAvg):
     def aggregate_fit(self, server_round, results, failures):
         aggregated = super().aggregate_fit(server_round, results, failures)
 
+        # Flower may return (None, metrics) if nothing aggregated
         if aggregated is None:
             return None
 
-        parameters_aggregated, metrics_aggregated = aggregated
+        params_agg, metrics_agg = aggregated
+        if params_agg is None:
+            # Nothing to aggregate this round -> propagate None upward
+            # (also prevents your autoscaler from crashing)
+            return None, metrics_agg
 
-        # Run kNN eval on aggregated global model
-        ndarrays = parameters_to_ndarrays(parameters_aggregated)
-        self._set_model_from_global_params(ndarrays)
+        # --- FedEMA autoscaler code below ---
+        global_nd = parameters_to_ndarrays(params_agg)
+        global_model = global_nd[: self.n_model_params]
 
-        train_feats, train_labels = extract_feats(self.eval_model, self.train_ld, self.device)
-        test_feats, test_labels   = extract_feats(self.eval_model, self.test_ld,  self.device)
-        acc = knn_acc(train_feats, train_labels, test_feats, test_labels, k=200, temperature=0.1)
+        for client_proxy, fit_res in results:
+            cid = client_proxy.cid
+            if self.state.lambda_k.get(cid, None) is not None:
+                continue
 
-        print(f"[Server] round={server_round} kNN acc={acc*100:.2f}%")
+            client_nd = parameters_to_ndarrays(fit_res.parameters)
+            client_model = client_nd[: self.n_model_params]
 
-        # optionally report to Flower metrics
-        metrics_aggregated = metrics_aggregated or {}
-        metrics_aggregated["knn_acc"] = acc
+            div = l2_norm_between(global_model, client_model)
+            lam = self.state.tau / (div + self.state.eps)
+            self.state.lambda_k[cid] = float(lam)
 
-        return parameters_aggregated, metrics_aggregated
+        return params_agg, metrics_agg
+

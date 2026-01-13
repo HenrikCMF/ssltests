@@ -26,7 +26,7 @@ class ResNet18v1(nn.Module):
     
 
 class ResNet18Projv2(nn.Module):
-    def __init__(self, emb_dim=128):
+    def __init__(self, emb_dim=2048):
         super().__init__()
         base = models.resnet18()#(weights=models.ResNet18_Weights.IMAGENET1K_V1)
         base.fc = nn.Identity()

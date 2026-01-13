@@ -24,7 +24,7 @@ DEVICE = get_device()
 class FedClient(fl.client.NumPyClient):
     def __init__(self, cid: int, num_partitions: int, local_epochs: int, batch_size: int):
         self.weight_storage="local_weights/"
-        self.embedding_size=128
+        self.embedding_size=2048
         self.cid = int(cid)
         self.EMA_target_path=self.weight_storage+"target"+str(self.cid)+".pt"
         self.model_target_path=self.weight_storage+"model"+str(self.cid)+".pt"
@@ -43,59 +43,72 @@ class FedClient(fl.client.NumPyClient):
         device=DEVICE
         )
         self.global_ema_decay = 0.996
+        self.train_loader, self.val_loader = data_obj.get_loaders()
         self.SSL_trainer = SimpleBYOL(
             online_encoder=self.model,
             target_encoder=self.EMA,
-            emb_dim=128,
+            emb_dim=self.embedding_size,
             lr=3e-4,
             moving_average_decay=0.996,
-            use_ema=True,        )
-        self.train_loader, self.val_loader = data_obj.get_loaders()
+            use_ema=True,
+            local_epochs=self.local_epochs,
+            dataset_len=len(self.train_loader.dataset),
+                            )
+        
 
     def fit(self, parameters, config):
-        FFC = self.load_local()
-        if FFC:
-            # local copies
+        # Server-provided FedEMA state
+        selected_prev = bool(int(config.get("selected_prev", 0)))
+        lambda_k = float(config.get("lambda_k", -1.0))
+        lambda_k = None if lambda_k < 0 else lambda_k
+
+        has_local = self.load_local()
+
+        # Case A: first time OR not selected in r-1 OR lambda_k is null  -> reset to global
+        if (not has_local) or (not selected_prev) or (lambda_k is None):
+            self.set_federated_parameters(parameters)
+            # init target = online (Wt_k <- Wg)
+            self.EMA.load_state_dict(self.model.state_dict())
+
+        # Case B: FedEMA divergence-aware dynamic mu update (Eq. 1-3 + Alg 1 line 16-18)
+        else:
+            # Snapshot previous local (r-1) BEFORE loading global
             local_model_sd = self._state_dict_clone(self.model.state_dict())
             local_pred_sd  = self._state_dict_clone(self.SSL_trainer.predictor.state_dict())
 
-            # load global into both
+            # Load current global (r)
             self.set_federated_parameters(parameters)
-            global_model_sd = self.model.state_dict()
-            global_pred_sd  = self.SSL_trainer.predictor.state_dict()
+            global_model_sd = self._state_dict_clone(self.model.state_dict())
+            global_pred_sd  = self._state_dict_clone(self.SSL_trainer.predictor.state_dict())
 
-            mu = 0.7
+            # divergence = ||Wg^r - Wk^{r-1}|| (encoder only)
+            with torch.no_grad():
+                s = 0.0
+                for k, g in global_model_sd.items():
+                    l = local_model_sd[k]
+                    diff = (g.float() - l.float())
+                    s += float((diff * diff).sum().item())
+                div = (s ** 0.5)
+
+            mu = min(lambda_k * div, 1.0)
+
+            # Wk^r <- mu * Wk^{r-1} + (1-mu) * Wg^r  (encoder)
             self.model.load_state_dict(self._ema_blend_state(local_model_sd, global_model_sd, mu))
+
+            # Wp_k^r <- mu * Wp_k^{r-1} + (1-mu) * Wp_g^r  (predictor)
             self.SSL_trainer.predictor.load_state_dict(self._ema_blend_state(local_pred_sd, global_pred_sd, mu))
 
-            # do NOT touch self.EMA here
+            # IMPORTANT: do NOT overwrite self.EMA here (target stays local; updated per mini-batch in BYOL)
 
-        else:
-            self.set_federated_parameters(parameters)
-
-            # initialize target = online
-            self.EMA.load_state_dict(self.model.state_dict())
-        train_loss= self.SSL_trainer.train(self.train_loader, epochs=self.local_epochs)
-        #self.SSL_trainer.
+        train_loss = self.SSL_trainer.train(self.train_loader, epochs=self.local_epochs)
         self.save_local()
-        #print(self.cid,train_loss)
         return self.get_federated_parameters(), len(self.train_loader.dataset), {"train_loss": train_loss}
 
 
-    def fit_fedbyol(self, parameters, config):
-        self.model.set_parameters(parameters)
-        FFC=self.load_local()
-        if not FFC:
-            self.EMA.load_state_dict(self.model.state_dict())
-        #self._ema_target_with_global(parameters, decay=0.7)
-        train_loss= self.SSL_trainer.train(self.train_loader, epochs=self.local_epochs)
-        self.save_local()
-        print(self.cid,train_loss)
-        return self.model.get_parameters(), len(self.train_loader.dataset), {"train_loss": train_loss}
-
     def evaluate(self, parameters, config):
         self.set_federated_parameters(parameters)
-        return 0.0, len(self.val_loader.dataset), {"accuracy": 0.0}
+        loss = self.SSL_trainer.evaluate(self.val_loader)  # you need to implement this
+        return float(loss), len(self.val_loader.dataset), {"val_loss": float(loss)}
 
     
 
@@ -164,3 +177,34 @@ if __name__=="__main__":
     #clinet=FedClient(1,2,3,64)
     #clinet.fit(None, None)
     pass
+
+"""""
+def fit(self, parameters, config):
+        FFC = self.load_local()
+        if FFC:
+            # local copies
+            local_model_sd = self._state_dict_clone(self.model.state_dict())
+            local_pred_sd  = self._state_dict_clone(self.SSL_trainer.predictor.state_dict())
+
+            # load global into both
+            self.set_federated_parameters(parameters)
+            global_model_sd = self.model.state_dict()
+            global_pred_sd  = self.SSL_trainer.predictor.state_dict()
+
+            mu = 0.7
+            self.model.load_state_dict(self._ema_blend_state(local_model_sd, global_model_sd, mu))
+            self.SSL_trainer.predictor.load_state_dict(self._ema_blend_state(local_pred_sd, global_pred_sd, mu))
+
+            # do NOT touch self.EMA here
+
+        else:
+            self.set_federated_parameters(parameters)
+
+            # initialize target = online
+            self.EMA.load_state_dict(self.model.state_dict())
+        train_loss= self.SSL_trainer.train(self.train_loader, epochs=self.local_epochs)
+        #self.SSL_trainer.
+        self.save_local()
+        #print(self.cid,train_loss)
+        return self.get_federated_parameters(), len(self.train_loader.dataset), {"train_loss": train_loss}
+"""
