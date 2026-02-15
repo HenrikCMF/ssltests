@@ -61,7 +61,8 @@ class CIFAR10BYOLClientData:
             seed: global seed for shuffling/partitioning (same for all clients).
         """
         assert 0 <= cid < num_clients, "cid must be in [0, num_clients-1]"
-
+        self.non_iid = True
+        self.classes_per_client = 10
         self.num_clients = num_clients
         self.cid = cid
         self.batch_size = batch_size
@@ -122,18 +123,48 @@ class CIFAR10BYOLClientData:
 
     def _partition_indices(self, n: int, num_clients: int, cid: int, generator: Optional[torch.Generator] = None):
         """
-        Deterministically shuffle [0..n-1] and return indices for client `cid`.
+        Deterministically partition indices.
+        - If self.non_iid: disjoint l classes per client (paper-style for CIFAR-10 l=2)
+        - Else: your original random IID partitioning
         """
-        if generator is None:
-            generator = torch.Generator()
-            generator.manual_seed(self.seed)
+        if not self.non_iid:
+            # Your original IID code (unchanged)
+            if generator is None:
+                generator = torch.Generator()
+                generator.manual_seed(self.seed)
 
-        perm = torch.randperm(n, generator=generator)
-        shard_size = n // num_clients
-        start = cid * shard_size
-        end = (cid + 1) * shard_size if cid != num_clients - 1 else n
-        idxs = perm[start:end]
-        return idxs.tolist()
+            perm = torch.randperm(n, generator=generator)
+            shard_size = n // num_clients
+            start = cid * shard_size
+            end = (cid + 1) * shard_size if cid != num_clients - 1 else n
+            idxs = perm[start:end]
+            return idxs.tolist()
+
+        # ── Non-IID: paper's l=2 classes per client ──
+        # Load targets from the base dataset
+        # (We need labels → assume base_dataset is CIFAR10 with .targets)
+        targets = torch.tensor(self._full_train_targets)
+
+        num_classes = 10  # CIFAR-10 hard-coded
+        assigned_classes = []
+
+        # Assign disjoint sets of classes_per_client classes to each client
+        # Example for K=5, l=2: client 0 → classes 0,1; client 1 → 2,3; ... client 4 → 8,9
+        start_class = cid * self.classes_per_client
+        for i in range(self.classes_per_client):
+            cls = (start_class + i) % num_classes  # modulo in case K*l > 10 (rare)
+            assigned_classes.append(cls)
+
+        idxs = []
+        for cls in assigned_classes:
+            class_indices = torch.nonzero(targets == cls).squeeze().tolist()
+            idxs.extend(class_indices)
+
+        # Shuffle within the client's data (good practice, paper likely does implicitly)
+        random.seed(self.seed + cid)  # deterministic per client
+        random.shuffle(idxs)
+
+        return idxs
 
     def _prepare_datasets(self):
         """
@@ -152,7 +183,8 @@ class CIFAR10BYOLClientData:
             download=True,
             transform=None,
         )
-
+        self._full_train_targets = full_train.targets
+        self._full_test_targets  = full_test.targets
         # Create deterministic generators for train/test partitioning
         gen_train = torch.Generator().manual_seed(self.seed)
         gen_test = torch.Generator().manual_seed(self.seed + 1)  # different, but still deterministic
