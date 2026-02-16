@@ -5,7 +5,7 @@ from pathlib import Path
 NUM_CLIENTS   = 5      # how many simulated FL clients
 NUM_ROUNDS    = 10      # how many FedAvg rounds
 LOCAL_EPOCHS  = 1      # BYOL epochs per round per client
-BATCH_SIZE    = 128
+BATCH_SIZE    = 256
 
 def client_fn(cid: str) -> fl.client.NumPyClient:
     """Construct a single client instance."""

@@ -52,7 +52,7 @@ class FedClient(fl.client.NumPyClient):
         selected_prev = bool(int(config.get("selected_prev", 0)))
         lambda_k = float(config.get("lambda_k", -1.0)) 
         lambda_k = None if lambda_k < 0 else lambda_k
-        lambda_k=0.8
+        #lambda_k=0.8
         NUM_ROUND=float(config.get("server_round", -1.0))
         has_local = self.load_local()
         
@@ -85,7 +85,7 @@ class FedClient(fl.client.NumPyClient):
                         s += float((diff * diff).sum().item())
                 div = (s ** 0.5)
 
-                mu = min(lambda_k * div, 1.0)
+                mu = max(min(lambda_k * div, 1.0),0.2)
                 #mu=0.6
             #print(f"Client {self.cid} round {NUM_ROUND} | lambda_k = {lambda_k} | selected_prev = {selected_prev} | has_local = {has_local}")
             # Wk^r <- mu * Wk^{r-1} + (1-mu) * Wg^r  (encoder)

@@ -88,16 +88,9 @@ class SimpleBYOL:
         EMA update of target encoder from online encoder.
         No gradients involved.
         """
-        #if not self.use_ema:
-        #    return
-        #for p_online, p_target in zip(self.online_encoder.parameters(),
-        #                              self.target_encoder.parameters()):
-        #    p_target.data.mul_(self.m).add_(p_online.data, alpha=1.0 - self.m)
         for p_online, p_target in zip(self.online_encoder.parameters(),
                                   self.target_encoder.parameters()):
-            #if p_target.requires_grad:  # Skip buffers
             p_target.data.mul_(self.m).add_(p_online.data, alpha=1.0 - self.m)
-
         for m_online, m_target in zip(self.online_encoder.modules(),
                                    self.target_encoder.modules()):
             if isinstance(m_online, (nn.BatchNorm1d, nn.BatchNorm2d)):
