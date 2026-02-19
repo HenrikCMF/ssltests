@@ -20,9 +20,8 @@ class SimpleBYOL:
         online_encoder: nn.Module,
         target_encoder: nn.Module,
         predictor: nn.Module,
-        emb_dim: int,
         lr: float = 0.032,
-        moving_average_decay: float = 0.996,
+        moving_average_decay: float = 0.99,
         device: str = None,
         use_ema: bool = True,
         local_epochs: int = 1,
@@ -37,39 +36,25 @@ class SimpleBYOL:
             device="cpu"
         self.device=device
         # Store encoders
+        self.dataset_len=dataset_len
         self.online_encoder = online_encoder.to(self.device)
         self.target_encoder = target_encoder.to(self.device)
+        self.predictor = predictor.to(self.device)
         self.local_epochs=local_epochs
         self.total_rounds=total_rounds
+        self.lr=lr
         # Target encoder: no gradients
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
         # Predictor head q_θ on top of online encoder output
-        self.predictor = predictor.to(self.device)
-
-
-        # Optimizer updates online encoder + predictor only
-        #self.optimizer = torch.optim.Adam(
-        #    list(self.online_encoder.parameters()) + list(self.predictor.parameters()),lr=lr,)
-        total_steps = max(1, local_epochs * max(1, dataset_len))
         self.optimizer = torch.optim.SGD(
-            list(self.online_encoder.parameters()) + list(self.predictor.parameters()),
-            lr=0.032,
+            list(self.online_encoder.parameters()) + list(self.predictor.parameters()),#+list(self.target_encoder.parameters()),
+            lr=self.lr,
             momentum=0.9,
-            weight_decay=1e-4,
+            weight_decay=0.0005,
         )
-
-        # cosine over total steps
-        #self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #    self.optimizer,
-        #    T_max=total_steps,
-        #)
-
-
-        #self.m = moving_average_decay
-        #self.m = 0.99
-        self.m = 0.99
+        self.m = moving_average_decay
         self.use_ema = use_ema
 
     @staticmethod
@@ -78,9 +63,9 @@ class SimpleBYOL:
         BYOL loss: 2 - 2 * cos_sim(p, z), averaged over batch.
         p, z: [B, D]
         """
-        p = F.normalize(p, dim=-1)
-        z = F.normalize(z, dim=-1)
-        return 2 - 2 * (p * z).sum(dim=-1).mean()
+        p = F.normalize(p, dim=-1, p=2)
+        z = F.normalize(z, dim=-1, p=2)
+        return 2 - 2 * (p * z).sum(dim=-1)
 
     @torch.no_grad()
     def _update_target(self):
@@ -88,22 +73,25 @@ class SimpleBYOL:
         EMA update of target encoder from online encoder.
         No gradients involved.
         """
-        for p_online, p_target in zip(self.online_encoder.parameters(),
-                                  self.target_encoder.parameters()):
-            p_target.data.mul_(self.m).add_(p_online.data, alpha=1.0 - self.m)
-        for m_online, m_target in zip(self.online_encoder.modules(),
-                                   self.target_encoder.modules()):
-            if isinstance(m_online, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                if m_online.running_mean is not None:
-                    m_target.running_mean.data.copy_(
-                        self.m * m_target.running_mean.data + 
-                        (1.0 - self.m) * m_online.running_mean.data
-                    )
-                if m_online.running_var is not None:
-                    m_target.running_var.data.copy_(
-                        self.m * m_target.running_var.data + 
-                        (1.0 - self.m) * m_online.running_var.data
-                    )
+        m = self.m
+        alpha = 1.0 - m
+
+        # 1. EMA on all parameters (weights + biases)
+        for p_online, p_target in zip(
+            self.online_encoder.parameters(),
+            self.target_encoder.parameters()
+        ):
+            #p_target.data.mul_(m).add_(p_online.data, alpha=alpha)
+            p_target.data=p_target.data * self.m + (1 - self.m) * p_online.data
+
+        # 2. EMA on all floating-point buffers (i.e. running_mean & running_var)
+        #    We skip num_batches_tracked because it's a counter (long dtype)
+        #for b_online, b_target in zip(
+        #    self.online_encoder.buffers(),
+        #    self.target_encoder.buffers()
+        #):
+        #    if b_online.dtype.is_floating_point:          # only mean/var
+        #        b_target.data.mul_(m).add_(b_online.data, alpha=alpha)
 
     def train(self, train_loader, epochs: int, server_round):
         """
@@ -116,14 +104,12 @@ class SimpleBYOL:
         """
         self.online_encoder.train()
         self.predictor.train()
-        self.target_encoder.eval()#.train()  # no gradients / BN updates
-        self.dataset_len = len(train_loader)
-        total_global_epochs = self.total_rounds * self.local_epochs
-        current_global_epoch = (server_round - 1) * self.local_epochs  # Start of this round's "global epoch"
-        progress = current_global_epoch / total_global_epochs
-        total_global_steps = self.total_rounds * self.local_epochs * self.dataset_len  # dataset_len = len(train_loader)
-        current_global_step = (server_round - 1) * self.local_epochs * self.dataset_len
+        #self.target_encoder.eval()#.train()  # no gradients / BN updates
+        #cos_lr = self.lr * 0.5 * (1 + math.cos(math.pi * progress))
+        #self.set_lr(cos_lr)
         #print(current_global_step," / ",total_global_steps)
+        total_global_steps = self.total_rounds * self.local_epochs * self.dataset_len
+        current_global_step = (server_round - 1) * self.local_epochs * self.dataset_len
         for epoch in range(epochs):
             total_loss = 0.0
             num_batches = 0
@@ -140,7 +126,7 @@ class SimpleBYOL:
 
                 x1 = x1.to(self.device, non_blocking=True)
                 x2 = x2.to(self.device, non_blocking=True)
-
+                self.optimizer.zero_grad()
                 # Online branch
                 z1_online = self.online_encoder(x1, normalize=False)      # [B, D]
                 z2_online = self.online_encoder(x2, normalize=False)      # [B, D]
@@ -152,24 +138,23 @@ class SimpleBYOL:
                 with torch.no_grad():
                     z1_target = self.target_encoder(x1, normalize=False)  # [B, D]
                     z2_target = self.target_encoder(x2, normalize=False)  # [B, D]
+                    z1_target = z1_target.detach()
+                    z2_target = z2_target.detach()
 
                 # Symmetric BYOL loss
-                loss = self._byol_loss(p1, z2_target) + self._byol_loss(p2, z1_target)
+                loss = (self._byol_loss(p1, z2_target) + self._byol_loss(p2, z1_target)).mean()
 
-                self.optimizer.zero_grad()
+                
                 loss.backward()
                 self.optimizer.step()
 
-
                 # EMA update of target from online (no gradient)
                 current_global_step += 1
-                progress = current_global_step / total_global_steps
-                
-                # Cosine schedule for momentum: 0.996 → 1.0
-                #self.m = 1 - (1 - base_m) * (math.cos(math.pi * progress) + 1) / 2
-
                 #progress = current_global_step / total_global_steps
-                cos_lr = 0.032 * 0.5 * (1 + math.cos(math.pi * progress))
+                
+
+                progress = current_global_step / total_global_steps
+                cos_lr = self.lr * 0.5 * (1 + math.cos(math.pi * progress))
                 self.set_lr(cos_lr)
                 self._update_target()
 

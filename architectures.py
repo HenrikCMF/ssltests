@@ -8,63 +8,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.resnet import ResNet, BasicBlock
 from torchvision import datasets, transforms, models
-
-class ResNet18v1(nn.Module):
-    def __init__(self, emb_dim=128):
-        super().__init__()
-        base = models.resnet18()#(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        base.fc = nn.Identity()
-        self.backbone = base
-        self.proj = nn.Sequential(
-            nn.Linear(512, 512), nn.ReLU(inplace=True),
-            nn.Linear(512, emb_dim)
-        )
-    def forward(self, x, normalize=True):
-        h = self.backbone(x)
-        z = self.proj(h)
-        return F.normalize(z, dim=1) if normalize else z
     
-
 def build_models(emb_dim=2048):
     EMA=ResNet18Projv3(emb_dim=emb_dim)
     model=ResNet18Projv3(emb_dim=emb_dim)
+    p_model=ResNet18Projv3(emb_dim=emb_dim)
     predictor = nn.Sequential(
             nn.Linear(emb_dim, 4096),
             nn.BatchNorm1d(4096),
             nn.ReLU(inplace=True),
-            nn.Linear(4096, emb_dim, bias=False))
-    return model, EMA, predictor
-
-class ResNet18Projv2(nn.Module):
-    def __init__(self, emb_dim=2048):
-        super().__init__()
-        base = models.resnet18()#(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        base.fc = nn.Identity()
-        self.backbone = base
-        self.proj = nn.Sequential(
-            nn.Linear(512, 2048, bias=False),
-            nn.BatchNorm1d(2048),
+            nn.Linear(4096, emb_dim),
+            #nn.BatchNorm1d(emb_dim, affine=False)
+            )
+    p_predictor=nn.Sequential(
+            nn.Linear(emb_dim, 4096),
+            nn.BatchNorm1d(4096),
             nn.ReLU(inplace=True),
-            nn.Linear(2048, emb_dim, bias=False),
-            nn.BatchNorm1d(emb_dim, affine=False)
-        )
-    def forward(self, x, normalize=True):
-        h = self.backbone(x)
-        z = self.proj(h)
-        return F.normalize(z, dim=1) if normalize else z
-
-    def encode_backbone(self, x, normalize=True):
-        h = self.backbone(x)               # [B,512]
-        return F.normalize(h, dim=1) if normalize else h
-    
-    def get_parameters(self):
-        return [p.detach().cpu().numpy() for p in self.parameters()]
-    
-    def set_parameters(self, parameters):
-        with torch.no_grad():
-            for param, new_param in zip(self.parameters(), parameters):
-                param.copy_(torch.from_numpy(new_param))
-
+            nn.Linear(4096, emb_dim),
+            #nn.BatchNorm1d(emb_dim, affine=False)
+            )
+    return model, EMA, predictor, p_model, p_predictor
 
 class CIFARResNet18Backbone(ResNet):
     def __init__(self):
@@ -96,19 +59,26 @@ class ResNet18Projv3(nn.Module):
         self.backbone = CIFARResNet18Backbone()
 
         # Paper: "replace last linear with a two-layer MLP, same as predictor"
+        #self.proj = nn.Sequential(
+        #    nn.Linear(512, 4096, bias=True), #Should possibly be True
+        #    nn.BatchNorm1d(4096),
+        #    nn.ReLU(inplace=True),
+        #    nn.Linear(4096, emb_dim, bias=False),
+        #)
         self.proj = nn.Sequential(
-            nn.Linear(512, 4096, bias=True), #Should possibly be True
+            nn.Linear(512, 4096),
             nn.BatchNorm1d(4096),
             nn.ReLU(inplace=True),
-            nn.Linear(4096, emb_dim, bias=False),
+            nn.Linear(4096, emb_dim),#Maybe False
+            #nn.BatchNorm1d(emb_dim, affine=False)
         )
 
-    def forward(self, x, normalize=True):
+    def forward(self, x, normalize=False):
         h = self.backbone(x)          # [B,512]
         z = self.proj(h)              # [B,2048]
         return F.normalize(z, dim=1) if normalize else z
 
     @torch.no_grad()
-    def encode_backbone(self, x, normalize=True):
+    def encode_backbone(self, x, normalize=False):
         h = self.backbone(x)
         return F.normalize(h, dim=1) if normalize else h

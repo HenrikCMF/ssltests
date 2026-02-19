@@ -15,6 +15,7 @@ from torchvision import datasets, transforms as T
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
 from dataloader import build_eval_loaders
+#from dataloader import build_server_eval_loaders
 import numpy as np
 from typing import List
 
@@ -26,8 +27,47 @@ def l2_norm_between(a: List[np.ndarray], b: List[np.ndarray]) -> float:
         s += float(np.sum(diff * diff))
     return float(np.sqrt(s))
 
+def l2_norm_between_filtered(
+    a: List[np.ndarray], b: List[np.ndarray], include_indices: List[int]
+) -> float:
+    """L2 norm but only over a subset of parameter indices (e.g. skip BN stats)."""
+    s = 0.0
+    #for i in include_indices:
+    #    ai = a[i]
+    #    bi = b[i]
+    #    diff = ai.astype(np.float64) - bi.astype(np.float64)
+    #    s += float(np.sum(diff * diff))
+    #return float(np.sqrt(s))
+    size = 0
+    total_distance = 0
+    num_layers = len(include_indices)
+    for i in include_indices:
+        a_tensor = torch.from_numpy(a[i])
+        b_tensor = torch.from_numpy(b[i])
+        total_distance += torch.dist(a_tensor, b_tensor)
+        size+=1
+    return total_distance / size
+        #ai = a[i].astype(np.float64)
+        #bi = b[i].astype(np.float64)
+        #diff = ai - bi
+        #s += np.sum(diff * diff)  # sum sq
+    #return float(np.sqrt(s / num_layers)) if num_layers > 0 else 0.0
+
 @torch.no_grad()
-def extract_feats(encoder, loader, device, normalize=True):
+def calibrate_bn(model, loader, device, num_batches=50):
+    model = model.to(device)
+    model.train()
+    # Only need to forward; no gradients
+    for i, (x, _) in enumerate(loader):
+        if i >= num_batches:
+            break
+        x = x.to(device, non_blocking=True)
+        # Forward through backbone to update BN stats
+        _ = model.encode_backbone(x, normalize=False)
+    model.eval()
+
+@torch.no_grad()
+def extract_feats(encoder, loader, device, normalize=True, use_pred=False):
     encoder = encoder.to(device)
     encoder.eval()
     for module in encoder.modules():
@@ -38,7 +78,13 @@ def extract_feats(encoder, loader, device, normalize=True):
         x = x.to(device, non_blocking=True)
 
         # Paper eval: remove encoder MLP -> use backbone representation
-        z = encoder.encode_backbone(x, normalize=normalize)  # [B,512]
+        if use_pred:
+            z = encoder(x, normalize=False)
+            if normalize:
+                z = F.normalize(z, dim=1)
+        else:
+            z = encoder.encode_backbone(x, normalize=normalize)  # [B,512]
+
 
         feats.append(z.detach().cpu())
         labels.append(y)
@@ -47,6 +93,7 @@ def extract_feats(encoder, loader, device, normalize=True):
 @torch.no_grad()
 def knn_acc(train_feats, train_labels, test_feats, test_labels, k=200, temperature=0.1):
     # cosine sim because features are L2-normalized
+    k = min(k, train_feats.shape[0])
     sims = test_feats @ train_feats.T
     topk_sims, topk_idx = sims.topk(k=k, dim=1)
     topk_labels = train_labels[topk_idx]
@@ -55,7 +102,7 @@ def knn_acc(train_feats, train_labels, test_feats, test_labels, k=200, temperatu
     #weights = torch.ones_like(topk_sims)
     num_classes = int(train_labels.max().item()) + 1
 
-    votes = torch.zeros(test_feats.size(0), num_classes)
+    votes = torch.zeros(test_feats.size(0), num_classes, device=test_feats.device)
     for c in range(num_classes):
         votes[:, c] = (weights * (topk_labels == c).float()).sum(dim=1)
 
@@ -137,7 +184,7 @@ class FedEMAStrategy(fl.server.strategy.FedAvg):
             # No successful client updates this round -> skip
             return None
         global_nd = parameters_to_ndarrays(params_agg)
-        global_model = global_nd#[: self.n_model_params]
+        global_model = global_nd[: self.n_model_params]
 
         # Autoscaler: set lambda_k once at earliest participation
         for client_proxy, fit_res in results:
@@ -146,11 +193,11 @@ class FedEMAStrategy(fl.server.strategy.FedAvg):
                 continue  # already set once
 
             client_nd = parameters_to_ndarrays(fit_res.parameters)
-            client_model = client_nd#[: self.n_model_params]
+            client_model = client_nd[: self.n_model_params]
 
             div = l2_norm_between(global_model, client_model)
-
-            lam = self.state.tau / (div)# + self.state.eps)
+            #div = l2_norm_between_filtered(global_model, client_model, self.enc_div_indices)
+            lam = self.state.tau / (div + self.state.eps)
             self.state.lambda_k[cid] = float(lam)
 
         return params_agg, metrics_agg
@@ -169,10 +216,43 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         self.train_ld, self.test_ld = build_eval_loaders(
             data_dir=data_dir, batch_size=512, num_workers=4
         )
+        #self.label_ld, self.eval_ld = build_server_eval_loaders(
+        #    data_dir=data_dir,
+        #    batch_size=512,
+        #    num_workers=4,
+        #    num_clients=6,   # or pass explicitly via your config
+        #    server_cid=5,
+        #    classes_per_client=10,
+            #seed=kwargs.get("seed", 12345),
+        #    non_iid=False,  # recommended False for 10/class
+        #    labeled_per_class=10,
+        #    eval_on_remaining_train_plus_test=True,       # "whole rest of CIFAR-10"
+        #)
+        sd = self.eval_model.state_dict()
+        self.enc_div_indices: List[int] = []
+        idx = 0
+        #for k, v in sd.items():
+        #    if torch.is_tensor(v) and v.is_floating_point():
+                #if 'running_mean' not in k and 'running_var' not in k:
+        #        if 'conv' in k and 'weight' in k:
+        #            self.enc_div_indices.append(idx)
+        #        idx += 1
 
     def _enc_float_keys(self):
         sd = self.eval_model.state_dict()
         return [k for k, v in sd.items() if torch.is_tensor(v) and v.is_floating_point()]
+        
+    def _enc_float_keys_bn(self):
+        sd = self.eval_model.state_dict()
+        keys = []
+        for k, v in sd.items():
+            if not (torch.is_tensor(v) and v.is_floating_point()):
+                continue
+            # Exclude BN running stats buffers so the ndarray ordering matches the clients
+            if ("running_mean" in k) or ("running_var" in k):
+                continue
+            keys.append(k)
+        return keys
 
     def _load_encoder_from_ndarrays(self, nds):
         """
@@ -191,6 +271,11 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
             new_sd[k] = t.to(dtype=sd[k].dtype).view_as(sd[k])
 
         self.eval_model.load_state_dict(new_sd, strict=False)
+
+    
+        
+
+
     def _train_linear_probe(
         self,
         train_feats: torch.Tensor,
@@ -247,33 +332,45 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
             return None
 
         self._load_encoder_from_ndarrays(nds)
-
+        #calibrate_bn(self.eval_model, self.train_ld, self.device, num_batches=50)
         # Extract features once (backbone 512-dim, same as kNN)
-        train_feats, train_labels = extract_feats(self.eval_model, self.train_ld, self.device, normalize=True)
-        test_feats,  test_labels  = extract_feats(self.eval_model, self.test_ld,  self.device, normalize=True)
+        train_feats, train_labels = extract_feats(self.eval_model, self.train_ld, self.device, normalize=True, use_pred=False)
+        test_feats,  test_labels  = extract_feats(self.eval_model, self.test_ld,  self.device, normalize=True, use_pred=False)
+        #train_feats, train_labels = extract_feats(
+        #    self.eval_model, self.label_ld, self.device, normalize=True, use_pred=False
+        #)
+        #test_feats, test_labels = extract_feats(
+        #    self.eval_model, self.eval_ld, self.device, normalize=True, use_pred=False
+        #)
+        #p_train_feats, p_train_labels = extract_feats(self.eval_model, self.train_ld, self.device, normalize=True, use_pred=True)
+        #p_test_feats,  p_test_labels  = extract_feats(self.eval_model, self.test_ld,  self.device, normalize=True, use_pred=True)
 
-        #train_feats_raw, train_labels_raw = extract_feats(self.eval_model, self.train_ld, self.device, normalize=False)
-        #test_feat_raw,  test_labels_raw  = extract_feats(self.eval_model, self.test_ld,  self.device, normalize=False)
 
         # kNN (existing)
-        acc_knn = knn_acc(
+        #k_eff = min(self.k, train_feats.shape[0])
+        b_acc_knn = knn_acc(
             train_feats, train_labels,
             test_feats,  test_labels,
             k=self.k, temperature=self.temperature
         )
+        #pred_acc_knn = knn_acc(
+        #    p_train_feats, p_train_labels,
+        #    p_test_feats,  p_test_labels,
+        #    k=self.k, temperature=self.temperature
+        #)
 
         # ← NEW: Linear probing
-        acc_linear = self._train_linear_probe(
-            train_feats, train_labels,
-            test_feats,  test_labels,
-            num_epochs=10,      # 5-10 = fast monitoring, 50-100 = more accurate
-            lr=0.5,
-        )
+        #acc_linear = self._train_linear_probe(
+        #    train_feats, train_labels,
+        #    test_feats,  test_labels,
+        #    num_epochs=10,      # 5-10 = fast monitoring, 50-100 = more accurate
+        #    lr=0.5,
+        #)
 
         torch.save(self.eval_model.state_dict(), f"eval_model.pth")
 
-        loss = 1.0 - acc_knn  # Flower still expects a loss; you can change to 1-acc_linear if you prefer
+        loss = 1.0 - b_acc_knn  # Flower still expects a loss; you can change to 1-acc_linear if you prefer
 
         #print(f"Round {server_round:3d} | kNN: {acc_knn*100:5.2f}% | Linear: {acc_linear*100:5.2f}%")
 
-        return loss, {"knn_acc": acc_knn, "linear_acc": acc_linear}
+        return loss, {"knn_acc": b_acc_knn}#, "pred_knn_acc": pred_acc_knn}#, "linear_acc": acc_linear}

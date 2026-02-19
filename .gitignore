@@ -1,1 +1,5 @@
 data/*.tar.gz
+*.pth
+*.txt
+*.pt
+*.pkl

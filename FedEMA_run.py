@@ -2,7 +2,7 @@ import os
 #os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # only expose big GPU
 import flwr as fl
 from flwr.common import ndarrays_to_parameters
-from client import FedClient
+from client import FedClient, _state_dict_keys_float
 import shutil
 from pathlib import Path
 import torch
@@ -10,10 +10,11 @@ from architectures import build_models
 from flwr.common import Context
 import time
 from server import FedEMAStrategyWithKnn
-NUM_CLIENTS   = 5     # how many simulated FL clients
-NUM_ROUNDS    = 100   # how many FedAvg rounds
-LOCAL_EPOCHS  = 5     # BYOL epochs per round per client
+NUM_CLIENTS   = 5  
+NUM_ROUNDS    = 100
+LOCAL_EPOCHS  = 5  
 BATCH_SIZE    = 128
+EMBEDDING_SIZE=2048
 def client_fn(context: Context) -> fl.client.Client:
     if "partition-id" in context.node_config:
         cid = int(context.node_config["partition-id"])
@@ -24,20 +25,32 @@ def client_fn(context: Context) -> fl.client.Client:
         num_partitions=NUM_CLIENTS,
         local_epochs=LOCAL_EPOCHS,
         batch_size=BATCH_SIZE,
-        total_rounds=NUM_ROUNDS
+        total_rounds=NUM_ROUNDS, 
+        embedding_size=EMBEDDING_SIZE
     ).to_client()
 def sd_float_arrays(module: torch.nn.Module):
     sd = module.state_dict()
     keys = [k for k, v in sd.items() if torch.is_tensor(v) and v.is_floating_point()]
     return [sd[k].detach().cpu().numpy() for k in keys]
 
-_tmp, _ema, tmp_pred = build_models(emb_dim=2048)
+def sd_float_arrays_bn(module):
+    sd = module.state_dict()
+    keys = _state_dict_keys_float(module)
+    return [sd[k].detach().cpu().numpy() for k in keys]
+
+
+_tmp, _ema, tmp_pred, _, _ = build_models(emb_dim=EMBEDDING_SIZE)
 init_nds = sd_float_arrays(_tmp) + sd_float_arrays(tmp_pred)
 initial_parameters = ndarrays_to_parameters(init_nds)
+#BN
+#init_nds = sd_float_arrays(_tmp) + sd_float_arrays(tmp_pred)
+#initial_parameters = ndarrays_to_parameters(init_nds)
 if __name__ == "__main__":
     _sd = _tmp.state_dict()
-    N_MODEL = sum(1 for _, v in _sd.items() if torch.is_tensor(v) and v.is_floating_point())
-
+    #{f"model.{k}": v for k, v in global_model_sd.items()} | {f"pred.{k}": v for k, v in global_pred_sd.items()}
+    N_MODEL = sum(1 for k, v in _sd.items() if torch.is_tensor(v) and v.is_floating_point())
+    #keys = _state_dict_keys_float(_tmp)
+    #N_MODEL = len(keys)     
     strategy = FedEMAStrategyWithKnn(
         tau=0.7,
         n_model_params=N_MODEL,
