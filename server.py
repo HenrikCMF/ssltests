@@ -1,12 +1,14 @@
 # fedema_strategy.py
 from __future__ import annotations
 
+import gc
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import flwr as fl
-from flwr.common import FitIns, Parameters, ndarrays_to_parameters, parameters_to_ndarrays
+from flwr.common import FitIns, Parameters, ndarrays_to_parameters, parameters_to_ndarrays, bytes_to_ndarray
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -18,6 +20,34 @@ from dataloader import build_eval_loaders
 #from dataloader import build_server_eval_loaders
 import numpy as np
 from typing import List
+from attacks import Loki, LokiConfig
+
+# Throughput flags for the server-side kNN eval (full forward over CIFAR each round).
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
+
+def rss_gb() -> float:
+    """Resident host memory (GB) of the *current* process, read from /proc."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / (1024 * 1024)   # kB -> GB
+    except Exception:
+        pass
+    return -1.0
+
+
+def log_mem(tag: str) -> None:
+    """DIAGNOSTIC: print this process's RSS (+ CUDA reserved if any) for tag."""
+    cuda = ""
+    if torch.cuda.is_available():
+        cuda = (f"  cuda_alloc={torch.cuda.memory_allocated()/1e9:.2f}GB"
+                f" reserved={torch.cuda.memory_reserved()/1e9:.2f}GB")
+    print(f"[MEM] {tag}: rss={rss_gb():.2f}GB{cuda}", flush=True)
 
 def l2_norm_between(a: List[np.ndarray], b: List[np.ndarray]) -> float:
     # sqrt(sum ||ai - bi||^2)
@@ -74,20 +104,22 @@ def extract_feats(encoder, loader, device, normalize=True, use_pred=False):
         if isinstance(module, nn.BatchNorm1d) or isinstance(module, nn.BatchNorm2d):
             module.track_running_stats = True
     feats, labels = [], []
+    use_amp = (str(device).startswith("cuda") or getattr(device, "type", "") == "cuda")
     for x, y in loader:
         x = x.to(device, non_blocking=True)
 
-        # Paper eval: remove encoder MLP -> use backbone representation
-        if use_pred:
-            z = encoder(x, normalize=False)
-            if normalize:
-                z = F.normalize(z, dim=1)
-        else:
-            z = encoder.encode_backbone(x, normalize=normalize)  # [B,512]
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            # Paper eval: remove encoder MLP -> use backbone representation
+            if use_pred:
+                z = encoder(x, normalize=False)
+                if normalize:
+                    z = F.normalize(z, dim=1)
+            else:
+                z = encoder.encode_backbone(x, normalize=normalize)  # [B,512]
 
-
-        feats.append(z.detach().cpu())
-        labels.append(y)
+        # Keep on device so the kNN similarity matmul runs on GPU.
+        feats.append(z.float().detach())
+        labels.append(y.to(device, non_blocking=True))
     return torch.cat(feats, 0), torch.cat(labels, 0)
 
 @torch.no_grad()
@@ -203,12 +235,45 @@ class FedEMAStrategy(fl.server.strategy.FedAvg):
         return params_agg, metrics_agg
 
 class FedEMAStrategyWithKnn(FedEMAStrategy):
-    def __init__(self, data_dir="./data", k=200, temperature=0.1, eval_model=None, **kwargs):
+    def __init__(self, data_dir="./data", k=200, temperature=0.1, eval_model=None,
+                 loki_config: Optional[LokiConfig] = None, loki_enabled: bool = False,
+                 loki_target_cid: int = 0, loki_extract_all: bool = False,
+                 loki_save_fragments: bool = True,
+                 loki_fragments_dir: str = "fragments",
+                 **kwargs):
         super().__init__(**kwargs)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.k = k
         self.temperature = temperature
+
+        # --- LOKI in-the-loop attack state (see attacks.Loki) ---------------- #
+        # When enabled, the malicious server arms a trap module for the target
+        # client only (model inconsistency) via configure_fit, then reconstructs
+        # that client's images from its returned update in aggregate_fit, re-arms,
+        # and repeats. All of this is inert when loki_enabled is False, so a
+        # normal FedBYOL/FedEMA run is unchanged.
+        self.loki_enabled = loki_enabled
+        self.loki = Loki(loki_config) if loki_enabled else None
+        self.loki_target_cid = loki_target_cid
+        # Full model inconsistency: arm every client with its own identity mapping
+        # set and reconstruct all of them from the de-aggregated aggregate update
+        # (Sec. 3.5/4.2). When False, only loki_target_cid is armed/reconstructed.
+        self.loki_extract_all = loki_extract_all
+        # Fragment dumping: per-bin .pt stacks for offline per-image reconstruction.
+        self.loki_save_fragments = loki_save_fragments
+        self.loki_fragments_dir = loki_fragments_dir
+        # Flower hands the strategy opaque ClientProxy ids; clients report their
+        # partition id in fit metrics so we can find the target (built round 1).
+        self._proxy_to_partition: Dict[str, int] = {}
+        # The FC1 weight/bias we armed the target with this round (to diff against
+        # the returned update). None until the target has been armed. In all-client
+        # mode the binning FC1 is identical for every client (only the conv set
+        # differs), so a single armed copy still diffs every client's update.
+        self._armed_fc1 = None
+        self._armed_bias = None
+        # Partitions armed this round (all-client mode); reconstructed in aggregate_fit.
+        self._armed_cids: list = []
 
         # Same encoder architecture as the clients’ encoder
         self.eval_model = eval_model
@@ -272,9 +337,301 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
 
         self.eval_model.load_state_dict(new_sd, strict=False)
 
-    
-        
+    # ------------------------------------------------------------------ #
+    # LOKI in-the-loop attack
+    # ------------------------------------------------------------------ #
+    def configure_fit(self, server_round, parameters, client_manager):
+        # Start from the FedEMA configuration (per-client lambda/selection config).
+        pairs = super().configure_fit(server_round, parameters, client_manager)
+        if not self.loki_enabled:
+            return pairs
 
+        if self.loki_extract_all:
+            return self._configure_fit_all(server_round, pairs)
+
+        # Model inconsistency: send the target client an armed trap module and
+        # every other client an inert (all-zero) module so they train the benign
+        # network untouched. Until the proxy->partition map is known (round 1),
+        # everyone is inert and the attack starts once the target is identified.
+        #
+        # Previous version deserialized the (identical) global model once PER
+        # client and built fresh all-zero fc1/fc2 (~0.5 GB each) for every inert
+        # client — ~10x the model size in transient host RAM. Kept for recovery:
+        # armed = []
+        # for client, fitins in pairs:
+        #     nds = parameters_to_ndarrays(fitins.parameters)
+        #     partition = self._proxy_to_partition.get(client.cid, None)
+        #     if partition == self.loki_target_cid:
+        #         nds = self._arm_target_module(nds, server_round)
+        #     else:
+        #         nds = self._inert_module(nds)
+        #     armed.append((client, FitIns(ndarrays_to_parameters(nds), fitins.config)))
+        # return armed
+
+        # The parent broadcasts the SAME global parameters to every client (only
+        # the per-client config differs), so deserialize it once and build just
+        # two payloads: one armed (target) and one inert (everyone else). Every
+        # non-target client is byte-identical, so they share a single serialized
+        # Parameters object instead of one per client. Both payloads also reuse
+        # the unchanged backbone arrays by reference (only the 4 module slots
+        # differ). This cuts configure_fit's peak host RAM several-fold.
+        base_nds = parameters_to_ndarrays(pairs[0][1].parameters)
+        armed_params = None
+        inert_params = None
+        out = []
+        for client, fitins in pairs:
+            partition = self._proxy_to_partition.get(client.cid, None)
+            if partition == self.loki_target_cid:
+                if armed_params is None:
+                    armed_params = ndarrays_to_parameters(
+                        self._arm_target_module(base_nds, server_round))
+                out.append((client, FitIns(armed_params, fitins.config)))
+            else:
+                if inert_params is None:
+                    inert_params = ndarrays_to_parameters(self._inert_module(base_nds))
+                out.append((client, FitIns(inert_params, fitins.config)))
+        return out
+
+    def _configure_fit_all(self, server_round, pairs):
+        """
+        Full model inconsistency (Sec. 3.5/4.2): arm every client with its OWN
+        identity mapping set so each client's images land in a disjoint block of
+        FC1's input, recoverable from the aggregate. The binning FC1/bias and FC2
+        are identical for all clients (same brightness cutoffs); only the conv
+        identity set differs per client, so the big FC1/FC2 arrays are built once
+        and shared by reference, while only the tiny conv slot is rebuilt per cid.
+
+        Clients whose partition id is not yet known (round 1, before any fit
+        metrics arrive) are sent an inert module and skipped this round.
+        """
+        base_nds = parameters_to_ndarrays(pairs[0][1].parameters)
+        ci, w1, b1, w2 = self._module_slots(base_nds)
+
+        # Redraw cutoffs from the learned distribution, then build the shared
+        # binning module once (conv set is overwritten per client below).
+        self.loki.setup_fc_biases("agnostic")
+        module = self.loki.build_module(active_cid=0)
+        w1_arr = module.fc1.weight.detach().cpu().numpy().astype(base_nds[w1].dtype)
+        b1_arr = module.fc1.bias.detach().cpu().numpy().astype(base_nds[b1].dtype)
+        w2_arr = module.fc2.weight.detach().cpu().numpy().astype(base_nds[w2].dtype)
+        # One armed FC1/bias copy diffs every client's update (binning is shared).
+        self._armed_fc1 = w1_arr.copy()
+        self._armed_bias = b1_arr.copy()
+
+        self._armed_cids = []
+        armed_cache = {}            # partition -> serialized Parameters
+        inert_params = None
+        out = []
+        for client, fitins in pairs:
+            partition = self._proxy_to_partition.get(client.cid, None)
+            if partition is None:
+                if inert_params is None:
+                    inert_params = ndarrays_to_parameters(self._inert_module(base_nds))
+                out.append((client, FitIns(inert_params, fitins.config)))
+                continue
+            if partition not in armed_cache:
+                # Per-client identity mapping set: only the conv slot differs.
+                self.loki._set_identity_mapping(module, partition)
+                conv_arr = module.conv.weight.detach().cpu().numpy().astype(base_nds[ci].dtype)
+                nds = list(base_nds)
+                nds[ci], nds[w1], nds[b1], nds[w2] = conv_arr, w1_arr, b1_arr, w2_arr
+                armed_cache[partition] = ndarrays_to_parameters(nds)
+                self._armed_cids.append(partition)
+            out.append((client, FitIns(armed_cache[partition], fitins.config)))
+        return out
+
+    def aggregate_fit(self, server_round, results, failures):
+        if self.loki_enabled:
+            # Refresh the proxy->partition map from the clients' reported ids.
+            for client, fit_res in results:
+                pid = (fit_res.metrics or {}).get("cid")
+                if pid is not None:
+                    self._proxy_to_partition[client.cid] = int(pid)
+            if self.loki_extract_all:
+                # Reconstruct every armed client from the de-aggregated aggregate.
+                if self._armed_fc1 is not None and self._armed_cids:
+                    self._loki_reconstruct_all(server_round, results)
+            elif self._armed_fc1 is not None:
+                # Single target: reconstruct from its individual update.
+                for client, fit_res in results:
+                    if self._proxy_to_partition.get(client.cid) == self.loki_target_cid:
+                        self._loki_reconstruct(server_round, fit_res)
+                        break
+        agg = super().aggregate_fit(server_round, results, failures)
+        # DIAGNOSTIC: force collection then report server RSS so a steady climb
+        # (true leak) is distinguishable from GC lag. Remove once memory is traced.
+        gc.collect()
+        log_mem(f"server aggregate_fit r{server_round}")
+        return agg
+
+    def _module_slots(self, nds):
+        """Indices of the LOKI module's float arrays (they lead the encoder)."""
+        # LokiEncoder.state_dict order: loki.conv.weight, loki.fc1.weight,
+        # loki.fc1.bias, loki.fc2.weight, then the benign net.
+        return 0, 1, 2, 3  # conv.weight, fc1.weight, fc1.bias, fc2.weight
+
+    def _arm_target_module(self, nds, server_round):
+        """Overwrite the module slots with trap weights crafted for the target."""
+        nds = list(nds)
+        # Re-draw bias cutoffs from the (incrementally learned, Sec. 4.1)
+        # distribution each round, then build the binning/identity-map module.
+        self.loki.setup_fc_biases("agnostic")
+        module = self.loki.build_module(active_cid=0)
+        ci, w1, b1, w2 = self._module_slots(nds)
+        nds[ci] = module.conv.weight.detach().cpu().numpy().astype(nds[ci].dtype)
+        nds[w1] = module.fc1.weight.detach().cpu().numpy().astype(nds[w1].dtype)
+        nds[b1] = module.fc1.bias.detach().cpu().numpy().astype(nds[b1].dtype)
+        nds[w2] = module.fc2.weight.detach().cpu().numpy().astype(nds[w2].dtype)
+        # Remember what we sent so we can diff it against the returned update.
+        self._armed_fc1 = nds[w1].copy()
+        self._armed_bias = nds[b1].copy()
+        return nds
+
+    def _inert_module(self, nds):
+        """Zero the module slots -> a transparent, zero-gradient passthrough."""
+        nds = list(nds)
+        for i in self._module_slots(nds):
+            nds[i] = np.zeros_like(nds[i])
+        return nds
+
+    def _loki_reconstruct(self, server_round, fit_res):
+        # Only FC1's weight/bias slots are read from the update, so decode just
+        # those two tensors instead of materializing the whole client model:
+        # the FC1 weight alone is multi-GB, so deserializing every layer (and
+        # holding a separate diff array) is what spikes server RSS each round.
+        _, w1, b1, _ = self._module_slots(None)
+        tensors = fit_res.parameters.tensors
+        ret_w1 = bytes_to_ndarray(tensors[w1])
+        ret_b1 = bytes_to_ndarray(tensors[b1])
+        # Eq. 6: the update the server sees is Theta_t - Theta_{t+1} (armed - returned).
+        # Subtract the returned weights into the armed copy in place so no third
+        # multi-GB array is allocated; from_numpy then aliases that same buffer.
+        self._armed_fc1 -= ret_w1
+        self._armed_bias -= ret_b1
+        upd_w = torch.from_numpy(self._armed_fc1)
+        upd_b = torch.from_numpy(self._armed_bias)
+        # The diff now lives in upd_w/upd_b; release the armed copies (re-armed
+        # fresh next round, so not needed here). None — not del — keeps the
+        # `is not None` guard in aggregate_fit valid on rounds that don't arm.
+        self._armed_fc1 = None
+        self._armed_bias = None
+        frags, counts = self.loki.reconstruct_with_bias_count(upd_w, upd_b, target_cid=0)
+
+        # Incremental bias learning (Sec. 4.1): refine the distribution using the
+        # cutoffs of every *fired* bin (count != 0), not just clean single-image
+        # bins. A fired neuron's cutoff sits just below a real image's brightness,
+        # so fired cutoffs sample the brightness density directly; blends sit in
+        # high-density regions and are correctly weighted. The clean-only set is a
+        # biased, under-dispersed sub-population (it selects the lowest-gradient
+        # bins) and shrinks the learned std, which bunches next round's cutoffs and
+        # compounds into lower leakage.
+        fired = counts != 0
+        if bool(fired.any()):
+            # `counts` is aligned 1:1 with the per-bin cutoff that owns it:
+            # FedAVG counts are per-neuron (full length); FedSGD counts are
+            # consecutive-bin differences, so they map to the lower cutoff edge.
+            cutoffs = self.loki.cutoffs
+            if not self.loki.cfg.fedavg:
+                cutoffs = cutoffs[:-1]
+            cutoffs = cutoffs.to(fired.device)
+            self.loki.learn_bias_distribution(cutoffs[fired].cpu().tolist())
+
+        # Dump per-bin fragments so each (probable) original image can be
+        # reconstructed offline from only its own across-round augmented views.
+        if self.loki_save_fragments:
+            # One file per round (regroup re-clusters across bins anyway, so the
+            # per-bin layout is unnecessary and floods the disk with tiny files).
+            # Previous per-bin saver kept commented for easy recovery:
+            # self.loki.save_fragments_by_bin(
+            #     frags, self.loki_fragments_dir, server_round, counts=counts
+            # )
+            self.loki.save_round_fragments(
+                frags, self.loki_fragments_dir, server_round, counts=counts
+            )
+
+        n_frags = len(frags)
+        print(f"[LOKI] round {int(server_round)}: reconstructed {n_frags} fragments")
+
+        # Drop the round's large transients before returning so the next round
+        # doesn't stack on top of them; the gc.collect() in aggregate_fit then
+        # reports the true resident set.
+        del upd_w, upd_b, ret_w1, ret_b1, frags, counts
+        gc.collect()
+
+    def _loki_reconstruct_all(self, server_round, results):
+        """
+        Full model inconsistency reconstruction (Sec. 3.5/4.2): form the secure
+        aggregate of the armed clients' FC1 weight updates and de-aggregate every
+        client from its own block.
+
+        The binning FC1 sent was identical for all clients, so the aggregated
+        weight "gradient" (Eq. 6 with secure-agg = sum) is n*armed - sum(returned).
+        Each client's images sit in a disjoint block of FC1's input (its identity
+        mapping set), and a client that did not own a block contributes ~0 there,
+        so reconstructing block k recovers client k. The FC1 *bias* gradient is
+        coupled across clients by aggregation and so cannot give a per-client
+        count; the per-client fired/empty signal is therefore read from the
+        de-aggregated *weight* block (reconstruct_with_fired).
+        """
+        _, w1, _, _ = self._module_slots(None)
+        armed = set(self._armed_cids)
+
+        # Securely aggregate (sum) the armed clients' returned FC1 weights.
+        sum_w = None
+        n = 0
+        for client, fit_res in results:
+            if self._proxy_to_partition.get(client.cid) not in armed:
+                continue
+            rw = bytes_to_ndarray(fit_res.parameters.tensors[w1])
+            if sum_w is None:
+                sum_w = rw                       # take ownership of the first array
+            else:
+                sum_w += rw
+            n += 1
+        if sum_w is None:
+            self._armed_fc1 = None
+            self._armed_bias = None
+            return
+
+        # Eq. 6 aggregated weight gradient: n*armed - sum(returned), in place to
+        # avoid a third multi-GB array.
+        self._armed_fc1 *= n
+        self._armed_fc1 -= sum_w
+        upd_w = torch.from_numpy(self._armed_fc1)
+        del sum_w
+        self._armed_fc1 = None
+        self._armed_bias = None
+
+        cutoffs = self.loki.cutoffs
+        if not self.loki.cfg.fedavg:
+            cutoffs = cutoffs[:-1]
+
+        fired_cutoffs = []
+        total = 0
+        for cid in sorted(armed):
+            frags, mass = self.loki.reconstruct_with_fired(upd_w, target_cid=cid)
+            fired = self.loki.fired_mask(mass)
+            if bool(fired.any()):
+                fired_cutoffs.extend(cutoffs.to(fired.device)[fired].cpu().tolist())
+            if self.loki_save_fragments:
+                # Per-client subdir so reconstructed data stays tied to its owner
+                # (Sec. 4.2). counts=fired marks the kept (non-empty) bins.
+                cdir = os.path.join(self.loki_fragments_dir, f"client_{cid:02d}")
+                self.loki.save_round_fragments(
+                    frags, cdir, server_round, counts=fired.long()
+                )
+            total += int(fired.sum())
+            del frags, mass, fired
+
+        # Bias-distribution learning from every fired bin across all clients
+        # (the binning FC1/bias is shared, so the distribution is global).
+        if fired_cutoffs:
+            self.loki.learn_bias_distribution(fired_cutoffs)
+
+        print(f"[LOKI] round {int(server_round)}: reconstructed {total} fragments "
+              f"across {len(armed)} clients")
+        del upd_w
+        gc.collect()
 
     def _train_linear_probe(
         self,
@@ -324,12 +681,23 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         return acc
 
     def evaluate(self, server_round, parameters):
+        if server_round % 5 != 0:
+            return None
         if parameters is None:
             return None
 
         nds = parameters_to_ndarrays(parameters)
         if len(nds) == 0:
             return None
+
+        # DIAGNOSTIC: the aggregated global model carries a non-inert trap module
+        # (target's trained module averaged with the others' zeros = target/num_clients),
+        # and encode_backbone runs inputs through it, so kNN is measured on `x + out`.
+        # Zero the module slots for eval ONLY (training is untouched) to score the
+        # backbone on clean x. If kNN recovers -> collapse was an eval-path artifact;
+        # if it stays low -> the shared backbone genuinely degraded.
+        if self.loki_enabled:
+            nds = self._inert_module(nds)
 
         self._load_encoder_from_ndarrays(nds)
         #calibrate_bn(self.eval_model, self.train_ld, self.device, num_batches=50)
