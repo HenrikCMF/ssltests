@@ -35,7 +35,7 @@ LOKI_TARGET_CID    = 0
 # with the client count -- reduce LOKI_LOCAL_DATASET when testing all-client mode.
 LOKI_EXTRACT_ALL   = True
 LOKI_LOCAL_DATASET = 10000#256#   # number of target images the trap layer aims to leak
-LOKI_FC_MULT       = 1#4     # FC neurons per image (split-scaling headroom)
+LOKI_FC_MULT       = 4#4     # FC neurons per image (split-scaling headroom)
 LOKI_CSF           = 100000.0  # high CSF clears the fp32 precision floor in the FedAVG weight delta (Eq.10, CSF^2 scaling) -- low CSF collapses the leak with fc_size=40k + small SSL gradients
 LOKI_SAVE_FRAGS    = True  # dump per-bin .pt fragment stacks for offline reconstruction
 # Model parallelism for the heavy all-client trap: each client (run sequentially)
@@ -43,7 +43,7 @@ LOKI_SAVE_FRAGS    = True  # dump per-bin .pt fragment stacks for offline recons
 # on the larger GPU, the frozen EMA target encoder on the smaller one. Defaults on
 # with LOKI_EXTRACT_ALL (where fc1 is widest); harmless on a single GPU.
 LOKI_MODEL_PARALLEL = False#LOKI_EXTRACT_ALL
-_loki_device = "cuda" if torch.cuda.is_available() else "cpu"
+_loki_device = "cpu"#"cuda" if torch.cuda.is_available() else "cpu"
 # One identity mapping set per client when extracting all (full model
 # inconsistency); a single set when targeting one client.
 _loki_num_clients = NUM_CLIENTS if LOKI_EXTRACT_ALL else 1
@@ -133,7 +133,7 @@ if __name__ == "__main__":
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources = {"num_cpus": 10, "num_gpus": 0.8}
+        client_resources = {"num_cpus": 8, "num_gpus": 1}
     )
     print(f"Total training time: {time.time()-start:.2f} seconds")
     folder = Path("local_weights")

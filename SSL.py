@@ -1,4 +1,5 @@
 import io
+import os
 import torch
 import math
 import torch.nn as nn
@@ -153,6 +154,11 @@ class SimpleBYOL:
     # ------------------------------------------------------------------ #
 
     def save(self, path_prefix: str) -> None:
+        # Ensure the target directory exists (e.g. local_weights/), since it is
+        # gitignored and absent on a fresh checkout such as a cluster node.
+        parent = os.path.dirname(path_prefix)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         torch.save(self.online_encoder.state_dict(), f"{path_prefix}_model.pt")
         torch.save(self.target_encoder.state_dict(), f"{path_prefix}_ema.pt")
         torch.save(self.predictor.state_dict(),      f"{path_prefix}_pred.pt")
@@ -279,7 +285,7 @@ class SimpleBYOL:
         for k in global_sd:
             g, l = global_sd[k], local_sd[k]
             if torch.is_tensor(g) and g.is_floating_point():
-                out[k] = (1.0 - mu) * l + mu * g
+                out[k] = torch.lerp(l, g, mu)
             elif "num_batches_tracked" in k:
                 out[k] = l
             else:

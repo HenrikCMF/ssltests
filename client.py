@@ -74,6 +74,10 @@ class FedClient(fl.client.NumPyClient):
                 cid=self.cid,
                 classes_per_client=2,
                 batch_size=batch_size,
+                # 0 = load in-process (no DataLoader subprocesses). Under the
+                # Flower/Ray simulation on a many-core node, forked workers
+                # deadlock and spawned workers stall; single-process loading of
+                # CIFAR-32x32 is cheap and GPU training dominates anyway.
                 num_workers=6,
                 keep_labels=False,
                 data_dir="./data",

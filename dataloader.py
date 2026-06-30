@@ -388,15 +388,23 @@ class CIFAR10BYOLClientData:
         """
         Create train and validation dataloaders for this client.
         """
+        # Spawn (not fork) the worker processes: under the Flower/Ray simulation
+        # these loaders are built inside multi-threaded Ray actors, where the
+        # default fork start method can inherit a locked mutex and deadlock the
+        # child (the "fork() may lead to deadlocks" warning). spawn starts clean
+        # processes and avoids it. Only valid when num_workers > 0.
+        mp_ctx = "spawn" if self.num_workers > 0 else None
+
         train_loader = DataLoader(
             self.client_train_byol,
             batch_size=self.batch_size,
             shuffle=True,            # local shuffle within the client's shard
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
             pin_memory=self.pin_memory,
             drop_last=True,
-            prefetch_factor=4,
+            prefetch_factor=4 if self.num_workers > 0 else None,
+            multiprocessing_context=mp_ctx,
         )
 
         val_loader = DataLoader(
@@ -406,6 +414,7 @@ class CIFAR10BYOLClientData:
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=False,
+            multiprocessing_context=mp_ctx,
         )
 
         return train_loader, val_loader

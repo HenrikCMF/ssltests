@@ -1,8 +1,12 @@
 data/*.tar.gz
 data/cifar-100-python/
+__pycache__/
 *.pth
 *.txt
 *.pt
 *.pkl
 *.png
 *.csv
+*.err
+*.out
+*.sif
