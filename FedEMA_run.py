@@ -33,7 +33,7 @@ BYOL_BASE_LR     = 0.032  # LR at batch size 128; scaled linearly with batch siz
 # for LOKI_TARGET_CID only each round, and reconstructs that client's images from
 # its returned update. Set False for a normal (unchanged) FedBYOL run. BYOL only.
 from attacks import Loki, LokiConfig
-LOKI_ATTACK        = False
+LOKI_ATTACK        = True
 LOKI_TARGET_CID    = 0
 
 LOKI_EXTRACT_ALL   = LOKI_ATTACK
@@ -142,7 +142,7 @@ if __name__ == "__main__":
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources = {"num_cpus": 10, "num_gpus": 0.9}
+        client_resources = {"num_cpus": 6, "num_gpus": 0.4}
     )
     print(f"Total training time: {time.time()-start:.2f} seconds")
     folder = Path("local_weights")
