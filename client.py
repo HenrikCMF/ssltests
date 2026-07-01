@@ -74,7 +74,7 @@ class FedClient(fl.client.NumPyClient):
                 cid=self.cid,
                 classes_per_client=2,
                 batch_size=batch_size,
-                num_workers=6,
+                num_workers=4,
                 keep_labels=False,
                 data_dir="./data",
                 seed=12345,
@@ -135,13 +135,20 @@ class FedClient(fl.client.NumPyClient):
         # DIAGNOSTIC: per-client worker RSS to localize the steady host-RAM climb.
         from server import log_mem
         log_mem(f"client {self.cid} fit r{int(self.NUM_ROUND)}")
-        return (
+        result = (
             self.trainer.get_parameters(),
             len(self.train_loader.dataset),
             # Report the partition id so the (malicious) server can map Flower's
             # opaque ClientProxy ids to partitions and target a specific client.
             {"train_loss": train_loss, "cid": self.cid},
         )
+        # The result above is CPU numpy and all state is on disk (_save_local), so
+        # this trainer's GPU models/grad/optimizer are now disposable. The actor
+        # runs the clients sequentially and rebuilds a fresh trainer next round;
+        # releasing here keeps the next client from stacking its ~5 GB on top of
+        # this one (the round-13 OOM was that doubled high-water mark).
+        self.trainer.release_gpu()
+        return result
 
     def evaluate(self, parameters, config):
         self.trainer.set_parameters(parameters)

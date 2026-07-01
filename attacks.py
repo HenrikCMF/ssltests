@@ -127,7 +127,14 @@ class LokiModule(nn.Module):
 
     def forward(self, x: torch.Tensor, residual: bool = True) -> torch.Tensor:
         conv_out = self.conv(x).flatten(1)              # [B, num_kernels*H*W]
-        h = self.activation(self.fc1(conv_out))         # [B, fc_size]
+        # Run FC1 in its own weight dtype with autocast disabled. For the online
+        # encoder (fp32 weight) this avoids autocast's transient bf16 copy of the
+        # ~2.5 GB weight on every forward (a ~1.2 GB peak-VRAM saving) and keeps the
+        # leaked weight gradient at full fp32 precision (the CSF is tuned to the
+        # fp32 floor, so an fp32 matmul is also the more faithful one). For the bf16
+        # target encoder the cast is a no-op and it simply runs bf16, no extra copy.
+        with torch.autocast(device_type=conv_out.device.type, enabled=False):
+            h = self.activation(self.fc1(conv_out.to(self.fc1.weight.dtype)))  # [B, fc_size]
         out = self.fc2(h).view(-1, self.C, self.H, self.W)
         # Residual bypass keeps the benign model's input ~unchanged (stealth):
         # the leak lives entirely in FC1's gradient, not the forward signal.

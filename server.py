@@ -23,10 +23,10 @@ from typing import List
 from attacks import Loki, LokiConfig
 
 # Throughput flags for the server-side kNN eval (full forward over CIFAR each round).
-torch.set_float32_matmul_precision("high")
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+#torch.set_float32_matmul_precision("high")
+#torch.backends.cuda.matmul.allow_tf32 = True
+#torch.backends.cudnn.allow_tf32 = True
+#torch.backends.cudnn.benchmark = False#True
 
 
 def rss_gb() -> float:
@@ -279,7 +279,7 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         self.eval_model = eval_model
 
         self.train_ld, self.test_ld = build_eval_loaders(
-            data_dir=data_dir, batch_size=512, num_workers=4
+            data_dir=data_dir, batch_size=128, num_workers=1
         )
         #self.label_ld, self.eval_ld = build_server_eval_loaders(
         #    data_dir=data_dir,
@@ -690,12 +690,7 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         if len(nds) == 0:
             return None
 
-        # DIAGNOSTIC: the aggregated global model carries a non-inert trap module
-        # (target's trained module averaged with the others' zeros = target/num_clients),
-        # and encode_backbone runs inputs through it, so kNN is measured on `x + out`.
-        # Zero the module slots for eval ONLY (training is untouched) to score the
-        # backbone on clean x. If kNN recovers -> collapse was an eval-path artifact;
-        # if it stays low -> the shared backbone genuinely degraded.
+
         if self.loki_enabled:
             nds = self._inert_module(nds)
 
@@ -704,14 +699,6 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         # Extract features once (backbone 512-dim, same as kNN)
         train_feats, train_labels = extract_feats(self.eval_model, self.train_ld, self.device, normalize=True, use_pred=False)
         test_feats,  test_labels  = extract_feats(self.eval_model, self.test_ld,  self.device, normalize=True, use_pred=False)
-        #train_feats, train_labels = extract_feats(
-        #    self.eval_model, self.label_ld, self.device, normalize=True, use_pred=False
-        #)
-        #test_feats, test_labels = extract_feats(
-        #    self.eval_model, self.eval_ld, self.device, normalize=True, use_pred=False
-        #)
-        #p_train_feats, p_train_labels = extract_feats(self.eval_model, self.train_ld, self.device, normalize=True, use_pred=True)
-        #p_test_feats,  p_test_labels  = extract_feats(self.eval_model, self.test_ld,  self.device, normalize=True, use_pred=True)
 
 
         # kNN (existing)
@@ -721,24 +708,25 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
             test_feats,  test_labels,
             k=self.k, temperature=self.temperature
         )
-        #pred_acc_knn = knn_acc(
-        #    p_train_feats, p_train_labels,
-        #    p_test_feats,  p_test_labels,
-        #    k=self.k, temperature=self.temperature
-        #)
-
-        # ← NEW: Linear probing
-        #acc_linear = self._train_linear_probe(
-        #    train_feats, train_labels,
-        #    test_feats,  test_labels,
-        #    num_epochs=10,      # 5-10 = fast monitoring, 50-100 = more accurate
-        #    lr=0.5,
-        #)
 
         torch.save(self.eval_model.state_dict(), f"eval_model.pth")
 
         loss = 1.0 - b_acc_knn  # Flower still expects a loss; you can change to 1-acc_linear if you prefer
 
         #print(f"Round {server_round:3d} | kNN: {acc_knn*100:5.2f}% | Linear: {acc_linear*100:5.2f}%")
+
+        # The 50k feature bank + the 10k x 50k kNN similarity matmul are sizeable
+        # GPU allocations that PyTorch's caching allocator otherwise keeps reserved
+        # across rounds. The driver shares one physical GPU with the client actor
+        # under Flower simulation, so drop the tensors and hand the reservation back
+        # before the next round of client training starts.
+        del train_feats, train_labels, test_feats, test_labels
+        # eval_model carries the full ~3 GB LOKI trap; extract_feats moved it onto
+        # the GPU the client actor trains on. It's idle until the next eval (every
+        # 5 rounds), so park it back on CPU so it stops squatting VRAM between evals
+        # (this was the ~3.5 GB second process pinned on the card).
+        self.eval_model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return loss, {"knn_acc": b_acc_knn}#, "pred_knn_acc": pred_acc_knn}#, "linear_acc": acc_linear}

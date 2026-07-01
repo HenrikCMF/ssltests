@@ -221,125 +221,7 @@ class CIFAR10BYOLClientData:
         random.shuffle(client_indices)
 
         return client_indices
-    @torch.no_grad()  # if you need no-grad in some contexts – otherwise remove
-    def _partition_indices_2(self, n: int, num_clients: int, cid: int, 
-                        generator: Optional[torch.Generator] = None):
-        """
-        Partition indices for federated learning.
-        
-        - If not self.non_iid:      classic random IID split (disjoint shards)
-        - If self.non_iid:          pathological non-IID (shards method)
-        → each class split into multiple shards
-        → each client gets exactly self.classes_per_client random shards
-        → aims for roughly balanced size per client
-        """
-        if not self.non_iid:
-            # ── IID: random disjoint partition ──
-            if generator is None:
-                generator = torch.Generator().manual_seed(self.seed)
-            perm = torch.randperm(n, generator=generator)
-            shard_size = n // num_clients
-            start = cid * shard_size
-            end = (cid + 1) * shard_size if cid < num_clients - 1 else n
-            return perm[start:end].tolist()
-
-        # ── Non-IID: shards-based pathological partitioning ──
-        # Assume self._full_train_targets exists and contains all labels (list or np.array)
-        labels = np.asarray(self._full_train_targets)   # shape (n,)
-        num_classes = len(np.unique(labels))            # 10 for CIFAR-10
-
-        # ── Decide number of shards per class ──
-        # Follows common practice: roughly (K × l) total shards
-        total_shards = num_clients * self.classes_per_client
-        shards_per_class = max(2, int(np.ceil(total_shards / num_classes)))
-
-        # For reproducibility across all clients
-        rng = np.random.default_rng(self.seed)
-        random.seed(self.seed)
-
-        # ── 1. Collect all shards ──
-        all_shards = []  # list of lists: pure-class index lists
-
-        for cls in range(num_classes):
-            cls_idx = np.where(labels == cls)[0]
-            rng.shuffle(cls_idx)
-
-            shard_size_base = len(cls_idx) // shards_per_class
-            remainder = len(cls_idx) % shards_per_class
-
-            pos = 0
-            for i in range(shards_per_class):
-                extra = 1 if i < remainder else 0
-                shard_end = pos + shard_size_base + extra
-                if pos < shard_end:  # avoid empty shards
-                    all_shards.append(cls_idx[pos:shard_end].tolist())
-                pos = shard_end
-
-        # ── 2. Shuffle shards globally and assign l to each client ──
-        rng.shuffle(all_shards)  # global random order
-
-        # Each client gets self.classes_per_client shards
-        shards_per_client = self.classes_per_client
-
-        start_shard = cid * shards_per_client
-        end_shard = start_shard + shards_per_client
-
-        client_shards = all_shards[start_shard:end_shard]
-
-        # Flatten + shuffle inside client (common & helps randomness)
-        client_indices = []
-        for shard in client_shards:
-            client_indices.extend(shard)
-
-        random.shuffle(client_indices)  # per-client shuffle, seeded above
-
-        return client_indices
-
-    def _partition_indices_old(self, n: int, num_clients: int, cid: int, generator: Optional[torch.Generator] = None):
-        """
-        Deterministically partition indices.
-        - If self.non_iid: disjoint l classes per client (paper-style for CIFAR-10 l=2)
-        - Else: your original random IID partitioning
-        """
-        if not self.non_iid:
-            # Your original IID code (unchanged)
-            if generator is None:
-                generator = torch.Generator()
-                generator.manual_seed(self.seed)
-
-            perm = torch.randperm(n, generator=generator)
-            shard_size = n // num_clients
-            start = cid * shard_size
-            end = (cid + 1) * shard_size if cid != num_clients - 1 else n
-            idxs = perm[start:end]
-            return idxs.tolist()
-
-        # ── Non-IID: paper's l=2 classes per client ──
-        # Load targets from the base dataset
-        # (We need labels → assume base_dataset is CIFAR10 with .targets)
-        targets = torch.tensor(self._full_train_targets)
-
-        num_classes = 10  # CIFAR-10 hard-coded
-        assigned_classes = []
-
-        # Assign disjoint sets of classes_per_client classes to each client
-        # Example for K=5, l=2: client 0 → classes 0,1; client 1 → 2,3; ... client 4 → 8,9
-        start_class = cid * self.classes_per_client
-        for i in range(self.classes_per_client):
-            cls = (start_class + i) % num_classes  # modulo in case K*l > 10 (rare)
-            assigned_classes.append(cls)
-
-        idxs = []
-        for cls in assigned_classes:
-            class_indices = torch.nonzero(targets == cls).squeeze().tolist()
-            idxs.extend(class_indices)
-
-        # Shuffle within the client's data (good practice, paper likely does implicitly)
-        random.seed(self.seed + cid)  # deterministic per client
-        random.shuffle(idxs)
-
-        return idxs
-
+    
     def _prepare_datasets(self):
         """
         Loads CIFAR-10 train and test and creates client-specific subsets.
@@ -393,7 +275,7 @@ class CIFAR10BYOLClientData:
             batch_size=self.batch_size,
             shuffle=True,            # local shuffle within the client's shard
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=False,
             pin_memory=self.pin_memory,
             drop_last=True,
             prefetch_factor=4,
@@ -427,8 +309,8 @@ def build_eval_loaders(data_dir="./data", batch_size=512, num_workers=2):
     ])
     train_ds = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
     test_ds  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=tfm)
-    train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_ld  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+    test_ld  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
     return train_ld, test_ld
 
 

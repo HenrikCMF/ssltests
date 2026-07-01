@@ -1,5 +1,8 @@
 import os
-#os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # only expose big GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # only expose big GPU
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.8")
+os.environ.setdefault("RAY_memory_monitor_refresh_ms", "0")#os.environ['RAY_memory_monitor_refresh_ms']="0"
+
 import flwr as fl
 from flwr.common import ndarrays_to_parameters
 from client import FedClient, _state_dict_keys_float
@@ -25,17 +28,10 @@ BYOL_BASE_LR     = 0.032  # LR at batch size 128; scaled linearly with batch siz
 from attacks import Loki, LokiConfig
 LOKI_ATTACK        = True
 LOKI_TARGET_CID    = 0
-# Extraction scope. False: arm + reconstruct LOKI_TARGET_CID only (one identity
-# mapping set). True: full model inconsistency (paper Sec. 3.5/4.2) -- every
-# client gets its OWN identity mapping set, the per-client updates are securely
-# aggregated (summed), and the server de-aggregates and reconstructs EVERY client
-# from disjoint weight blocks. Fragments are written per client under
-# fragments/client_XX/. NOTE: the conv layer and FC1's input grow ~linearly with
-# NUM_CLIENTS, so both model memory and the per-client serialized payload scale
-# with the client count -- reduce LOKI_LOCAL_DATASET when testing all-client mode.
+
 LOKI_EXTRACT_ALL   = True
 LOKI_LOCAL_DATASET = 10000#256#   # number of target images the trap layer aims to leak
-LOKI_FC_MULT       = 1#4     # FC neurons per image (split-scaling headroom)
+LOKI_FC_MULT       = 4#4     # FC neurons per image (split-scaling headroom)
 LOKI_CSF           = 100000.0  # high CSF clears the fp32 precision floor in the FedAVG weight delta (Eq.10, CSF^2 scaling) -- low CSF collapses the leak with fc_size=40k + small SSL gradients
 LOKI_SAVE_FRAGS    = True  # dump per-bin .pt fragment stacks for offline reconstruction
 # Model parallelism for the heavy all-client trap: each client (run sequentially)
@@ -43,7 +39,15 @@ LOKI_SAVE_FRAGS    = True  # dump per-bin .pt fragment stacks for offline recons
 # on the larger GPU, the frozen EMA target encoder on the smaller one. Defaults on
 # with LOKI_EXTRACT_ALL (where fc1 is widest); harmless on a single GPU.
 LOKI_MODEL_PARALLEL = False#LOKI_EXTRACT_ALL
-_loki_device = "cuda" if torch.cuda.is_available() else "cpu"
+# The server-side LOKI work (arming in configure_fit, reconstruction in
+# aggregate_fit) is bursty, off the training-critical path, and only ever read
+# out to CPU numpy / simple tensor ops -- but build_module().to(device) would put
+# the [fc_size, num_clients*C*H*W] FC1 (multi-GiB) on the *same physical GPU* the
+# client actor trains on, and PyTorch's caching allocator never hands that
+# reservation back. Under Flower simulation the driver (strategy) and the client
+# actor share one card, so keeping LOKI on CPU here frees ~10+ GiB of GPU for the
+# client without slowing the training loop. Override with LOKI_SERVER_DEVICE=cuda.
+_loki_device = os.environ.get("LOKI_SERVER_DEVICE", "cpu")
 # One identity mapping set per client when extracting all (full model
 # inconsistency); a single set when targeting one client.
 _loki_num_clients = NUM_CLIENTS if LOKI_EXTRACT_ALL else 1
@@ -133,7 +137,7 @@ if __name__ == "__main__":
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources = {"num_cpus": 10, "num_gpus": 0.8}
+        client_resources = {"num_cpus": 10, "num_gpus": 1}
     )
     print(f"Total training time: {time.time()-start:.2f} seconds")
     folder = Path("local_weights")

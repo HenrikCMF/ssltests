@@ -1,22 +1,3 @@
-"""
-regroup_fragments.py -- one-shot pipeline turning the raw, mixed LOKI leak bins
-into per-original bins the pretrained reconstructor can invert. Three stages:
-
-  1. SORT   drop blank fragments and the most heavily-cropped ones. Crop severity
-            (smooth + low effective resolution = a hard RandomResizedCrop) is scored
-            against a CIFAR-100 perturbation bank -- the "unknown reference" proxy,
-            so nothing about the real CIFAR-10 originals is assumed.
-  2. CLUSTER re-identify each original ACROSS the mixed bins with the BYOL encoder
-            (eval_model.pth): embed every usable fragment, build a kNN graph, and
-            DBSCAN by cosine density (unknown cluster count). Dense common-class
-            blobs are recursively re-split until every cluster is <= 99 fragments
-            (the LOKI per-original maximum).
-  3. WRITE  lay each cluster out as fragments_clustered/bin_*/round_*.pt.
-
-Then reconstruct with:
-    FRAG_DIR=fragments_clustered MIN_VIEWS=4 RECON_SUBDIR=cluster_recons \
-        python infer_fragments.py
-"""
 import glob
 import os
 import time
@@ -36,19 +17,14 @@ FRAG_DIR     = "fragments/client_00"
 OUT_DIR      = "fragments_clustered"
 CKPT         = "eval_model.pth"
 DATA_DIR     = R.DATA_DIR
-BATCH        = 4096
-# stage 1 -- crop-severity filter
-DROP_CROPPED = False          # False -> keep every non-blank fragment (skip severity)
-N_ORIG       = 1000          # CIFAR-100 originals in the calibration bank
-N_PERT       = R.NUM_PERTURB  # perturbations per original
-SEVERITY_PCT = 0.10          # drop the most-severe (most-cropped) this fraction
+BATCH        = 2048#4096
+
 BLANK_STD    = 0.05          # per-fragment raw std below this == blank
-# stage 2 -- DBSCAN clustering
-K_NN         = 32            # neighbours per point in the kNN graph
+K_NN         = 99#32            # neighbours per point in the kNN graph
 MIN_PTS      = 4             # min neighbours (incl. self) to be a core point
-EPS_SIM      = 0.89          # cosine-sim threshold (where the giant component dissolves)
-REFINE_CAP   = 198            # clusters above this are provably multi-original -> re-split
-REFINE_EPS   = (0.95, 0.96, 0.97, 0.98)
+EPS_SIM      = 0.9          # cosine-sim threshold (where the giant component dissolves)
+REFINE_CAP   = 99            # clusters above this are provably multi-original -> re-split
+REFINE_EPS   = (0.93,0.94,0.95, 0.96, 0.97, 0.98)
 SEED         = R.SEED
 
 _MEAN = torch.tensor(R.CIFAR_MEAN).view(1, 3, 1, 1)
@@ -75,79 +51,19 @@ def _load_round(path):
         obj = obj["frags"]
     return obj.float()
 
-
-# ---------------------------------------------------------------------------- #
-# Stage 1: crop severity
-# ---------------------------------------------------------------------------- #
-def hf_norm(u):
-    """Normalized high-frequency energy |Laplacian(u)|/std. Low == smooth == cropped."""
-    lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32,
-                       device=u.device).view(1, 1, 3, 3).repeat(3, 1, 1, 1)
-    return Fn.conv2d(u, lap, padding=1, groups=3).abs().mean(dim=(1, 2, 3)) / (u.flatten(1).std(1) + 1e-6)
-
-
-def res_resid(u):
-    """Downscale->upscale residual. Small == low effective resolution == upscaled crop."""
-    uu = Fn.interpolate(Fn.avg_pool2d(u, 2), scale_factor=2, mode="bilinear", align_corners=False)
-    return ((u - uu) ** 2).mean(dim=(1, 2, 3)) / (u.flatten(1).var(1) + 1e-6)
-
-
-def severity(u, hf_sorted, res_sorted):
-    """Crop-severity in [0,2] via the bank ECDFs: high == both smooth AND low-res."""
-    n = hf_sorted.numel()
-    p_hf = torch.searchsorted(hf_sorted, hf_norm(u).contiguous()).float() / n
-    p_res = torch.searchsorted(res_sorted, res_resid(u).contiguous()).float() / n
-    return (1.0 - p_hf) + p_res
-
-
-def calibrate_severity(device):
-    """Calibrate the severity ECDFs + drop threshold on a CIFAR-100 perturbation bank."""
-    raw = torchvision.datasets.CIFAR100(root=DATA_DIR, train=True, download=True).data
-    g = torch.Generator().manual_seed(SEED)
-    idx = torch.randperm(raw.shape[0], generator=g).numpy()[:N_ORIG]
-    print(f"calibrating crop-severity on {N_ORIG}x{N_PERT} CIFAR-100 perturbations...")
-    views = np.empty((N_ORIG * N_PERT, 3, R.IMG_SIZE, R.IMG_SIZE), dtype=np.uint8)
-    for i in range(N_ORIG):
-        views[i * N_PERT:(i + 1) * N_PERT] = R.pil_views(raw[idx[i]], N_PERT, seed=SEED * 7919 + i)
-
-    hf, res, std = [], [], []
-    v = torch.from_numpy(views)
-    for i in range(0, v.shape[0], BATCH):
-        vb = v[i:i + BATCH].to(device).float()
-        u = to_unit(vb)
-        hf.append(hf_norm(u).cpu()); res.append(res_resid(u).cpu())
-        std.append((vb / 255.0).flatten(1).std(1).cpu())
-    hf, res, std = (torch.cat(x) for x in (hf, res, std))
-    keep = std >= BLANK_STD
-    hf_sorted, res_sorted = hf[keep].sort().values, res[keep].sort().values
-    n = hf_sorted.numel()
-    p_hf = torch.searchsorted(hf_sorted, hf[keep].contiguous()).float() / n
-    p_res = torch.searchsorted(res_sorted, res[keep].contiguous()).float() / n
-    thr = float(((1.0 - p_hf) + p_res).quantile(1.0 - SEVERITY_PCT))
-    return hf_sorted.to(device), res_sorted.to(device), thr
-
-
-def sort_usable(hf_sorted, res_sorted, thr, device):
-    """Return the usable fragments as (round_file, local_index) items: always drop
-    blanks, and -- when DROP_CROPPED -- also drop the most heavily cropped (thr from
-    calibrate_severity). thr is None when DROP_CROPPED is off (keep every non-blank).
-    Items stay grouped by round file so the downstream loaders hit a 1-file cache."""
-    drop_cropped = thr is not None
+def collect_usable():
+    """Return non-blank fragments as (round_file, local_index) items, grouped by
+    file so the downstream loaders hit a 1-file cache."""
     files = sorted(glob.glob(os.path.join(FRAG_DIR, "round_*.pt")))
-    print(f"sorting {len(files)} round files "
-          f"({'drop blank + most-severe %.0f%%' % (SEVERITY_PCT*100) if drop_cropped else 'drop blank only (keep cropped)'})...")
-    items = []                                                 # (round_file, local_index)
+    print(f"scanning {len(files)} round files...")
+    items = []
     t0 = time.time()
     for fi, f in enumerate(files):
         frags = _load_round(f)
         if frags.numel() == 0:
             continue
-        live = frags.flatten(1).std(1) >= BLANK_STD            # drop blanks
-        live_idx = live.nonzero(as_tuple=True)[0]
+        live_idx = (frags.flatten(1).std(1) >= BLANK_STD).nonzero(as_tuple=True)[0]
         if live_idx.numel():
-            if drop_cropped:
-                sev = severity(to_unit(frags[live_idx].to(device)), hf_sorted, res_sorted).cpu()
-                live_idx = live_idx[sev < thr]
             items += [(f, int(j)) for j in live_idx.tolist()]
         if (fi + 1) % 50 == 0:
             print(f"  {fi+1}/{len(files)} files  ({time.time()-t0:.0f}s)", flush=True)
@@ -166,7 +82,6 @@ def embed_all(items, device):
     mean, std = _MEAN.to(device), _STD.to(device)
     print(f"embedding {len(items)} fragments...")
     out = torch.empty(len(items), 512, dtype=torch.float16)
-    t0 = time.time()
     cache_path, cache_t = None, None                           # items are file-grouped
     for i in range(0, len(items), BATCH):
         rows = []
@@ -178,7 +93,6 @@ def embed_all(items, device):
         with torch.autocast("cuda", enabled=device.type == "cuda"):
             e = Fn.normalize(net.backbone((to_unit(frags) - mean) / std), dim=1)
         out[i:i + e.shape[0]] = e.half().cpu()
-    print(f"  embedded in {time.time()-t0:.0f}s")
     return out
 
 
@@ -288,11 +202,7 @@ def materialize(labels, items):
 def main():
     device = R.get_device()
     print(f"device: {device}")
-    if DROP_CROPPED:
-        hf_sorted, res_sorted, thr = calibrate_severity(device)
-    else:
-        hf_sorted = res_sorted = thr = None
-    items = sort_usable(hf_sorted, res_sorted, thr, device)
+    items = collect_usable()
     E = embed_all(items, device)
     idx, sim = knn_graph(E, K_NN, device)
     labels = refine(dbscan(idx, sim, EPS_SIM, MIN_PTS, device), E, device)
