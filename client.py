@@ -4,7 +4,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import torch
 import flwr as fl
 from pathlib import Path
-from dataloader import CIFAR10BYOLClientData
+from dataloader import CIFAR10BYOLClientData, TinyImageNetBYOLClientData
 from architectures import build_models
 from SSL import SimpleBYOL
 import pickle
@@ -43,7 +43,8 @@ class FedClient(fl.client.NumPyClient):
                  batch_size: int, total_rounds: int, embedding_size: int,
                  byol_base_lr: float = 0.032,
                  loki: bool = False, loki_fc_size: int = 1024,
-                 loki_num_kernels: int = 3, model_parallel: bool = False):
+                 loki_num_kernels: int = 3,
+                 dataset: str = "cifar10", classes_per_client: int = 2):
         self.cid          = int(cid)
         self.local_epochs = local_epochs
         self.tau          = 0.7
@@ -60,19 +61,21 @@ class FedClient(fl.client.NumPyClient):
         self._lambda_path   = f"local_weights/lambda{self.cid}.pkl"
 
         # Reuse the per-process data object across rounds (see _DATA_CACHE).
-        cache_key = (self.cid, num_partitions, batch_size)
+        cache_key = (self.cid, num_partitions, batch_size, dataset)
         data_obj = _DATA_CACHE.get(cache_key)
         if data_obj is None:
-            # Verify/download the dataset only on the first client built in this
-            # process; subsequent constructions skip the MD5 integrity check.
             global _DATASET_VERIFIED
             download = not _DATASET_VERIFIED
             _DATASET_VERIFIED = True
 
-            data_obj = CIFAR10BYOLClientData(
+            _dataset_cls = (
+                TinyImageNetBYOLClientData if dataset == "tiny_imagenet"
+                else CIFAR10BYOLClientData
+            )
+            data_obj = _dataset_cls(
                 num_clients=num_partitions,
                 cid=self.cid,
-                classes_per_client=2,
+                classes_per_client=classes_per_client,
                 batch_size=batch_size,
                 num_workers=4,
                 keep_labels=False,
@@ -103,7 +106,6 @@ class FedClient(fl.client.NumPyClient):
             local_epochs=local_epochs,
             dataset_len=len(self.train_loader),
             total_rounds=total_rounds,
-            model_parallel=model_parallel,
         )
 
     # ------------------------------------------------------------------ #

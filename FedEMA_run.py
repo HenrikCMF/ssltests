@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # only expose big GPU
+#os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # only expose big GPU
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.8")
 os.environ.setdefault("RAY_memory_monitor_refresh_ms", "0")#os.environ['RAY_memory_monitor_refresh_ms']="0"
 
@@ -13,11 +13,18 @@ from architectures import build_models
 from flwr.common import Context
 import time
 from server import FedEMAStrategyWithKnn
-NUM_CLIENTS   = 5
-NUM_ROUNDS    = 100
-LOCAL_EPOCHS  = 5
-BATCH_SIZE    = 128#128
-EMBEDDING_SIZE=2048
+NUM_CLIENTS        = 5
+NUM_ROUNDS         = 100
+LOCAL_EPOCHS       = 5
+BATCH_SIZE         = 256
+EMBEDDING_SIZE     = 2048
+
+# ── Dataset selector ──────────────────────────────────────────────────────── #
+# "cifar10"       — 32×32 RGB, 10 classes, auto-downloaded via torchvision
+# "tiny_imagenet" — 64×64 RGB, 200 classes, auto-downloaded on first run
+DATASET            = "tiny_imagenet"
+CLASSES_PER_CLIENT = 40    # non-IID shards per client (e.g. 2/10 for CIFAR, 20/200 for TinyIN)
+# ─────────────────────────────────────────────────────────────────────────── #
 
 BYOL_BASE_LR     = 0.032  # LR at batch size 128; scaled linearly with batch size
 
@@ -26,19 +33,14 @@ BYOL_BASE_LR     = 0.032  # LR at batch size 128; scaled linearly with batch siz
 # for LOKI_TARGET_CID only each round, and reconstructs that client's images from
 # its returned update. Set False for a normal (unchanged) FedBYOL run. BYOL only.
 from attacks import Loki, LokiConfig
-LOKI_ATTACK        = True
+LOKI_ATTACK        = False
 LOKI_TARGET_CID    = 0
 
-LOKI_EXTRACT_ALL   = True
+LOKI_EXTRACT_ALL   = LOKI_ATTACK
 LOKI_LOCAL_DATASET = 10000#256#   # number of target images the trap layer aims to leak
 LOKI_FC_MULT       = 4#4     # FC neurons per image (split-scaling headroom)
 LOKI_CSF           = 100000.0  # high CSF clears the fp32 precision floor in the FedAVG weight delta (Eq.10, CSF^2 scaling) -- low CSF collapses the leak with fc_size=40k + small SSL gradients
-LOKI_SAVE_FRAGS    = True  # dump per-bin .pt fragment stacks for offline reconstruction
-# Model parallelism for the heavy all-client trap: each client (run sequentially)
-# gets BOTH GPUs during local training -- the trainable online encoder + predictor
-# on the larger GPU, the frozen EMA target encoder on the smaller one. Defaults on
-# with LOKI_EXTRACT_ALL (where fc1 is widest); harmless on a single GPU.
-LOKI_MODEL_PARALLEL = False#LOKI_EXTRACT_ALL
+LOKI_SAVE_FRAGS    = LOKI_ATTACK  # dump per-bin .pt fragment stacks for offline reconstruction
 # The server-side LOKI work (arming in configure_fit, reconstruction in
 # aggregate_fit) is bursty, off the training-critical path, and only ever read
 # out to CPU numpy / simple tensor ops -- but build_module().to(device) would put
@@ -51,8 +53,9 @@ _loki_device = os.environ.get("LOKI_SERVER_DEVICE", "cpu")
 # One identity mapping set per client when extracting all (full model
 # inconsistency); a single set when targeting one client.
 _loki_num_clients = NUM_CLIENTS if LOKI_EXTRACT_ALL else 1
+_image_shape = (3, 32, 32) if DATASET == "cifar10" else (3, 64, 64)
 loki_config = LokiConfig(
-    image_shape=(3, 32, 32), num_clients=_loki_num_clients, local_dataset_size=LOKI_LOCAL_DATASET,
+    image_shape=_image_shape, num_clients=_loki_num_clients, local_dataset_size=LOKI_LOCAL_DATASET,
     fc_multiplier=LOKI_FC_MULT, csf=LOKI_CSF, fedavg=True,
     bias_mean=0.0, bias_std=0.5, device=_loki_device,
 )
@@ -75,7 +78,8 @@ def client_fn(context: Context) -> fl.client.Client:
         loki=LOKI_ATTACK,
         loki_fc_size=LOKI_FC_SIZE,
         loki_num_kernels=LOKI_NUM_KERNELS,
-        model_parallel=LOKI_MODEL_PARALLEL,
+        dataset=DATASET,
+        classes_per_client=CLASSES_PER_CLIENT,
     ).to_client()
 def sd_float_arrays(module: torch.nn.Module):
     sd = module.state_dict()
@@ -121,6 +125,7 @@ if __name__ == "__main__":
         min_fit_clients=NUM_CLIENTS,
         min_available_clients=NUM_CLIENTS,
         data_dir="./data",
+        dataset=DATASET,
         k=200,
         temperature=0.1,
         initial_parameters=initial_parameters,
@@ -137,7 +142,7 @@ if __name__ == "__main__":
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources = {"num_cpus": 10, "num_gpus": 1}
+        client_resources = {"num_cpus": 10, "num_gpus": 0.9}
     )
     print(f"Total training time: {time.time()-start:.2f} seconds")
     folder = Path("local_weights")

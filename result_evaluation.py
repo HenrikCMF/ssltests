@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from architectures import ResNet18Projv3
-from dataloader import build_eval_loaders
+from dataloader import CIFAR10BYOLClientData
 
 EMBEDDING_SIZE = 2048          # must match training (FedEMA_run.py)
 CKPT = "eval_model.pth"
@@ -114,7 +114,7 @@ def main():
     print(f"device: {device} | checkpoint: {args.ckpt}")
 
     model = load_encoder(args.ckpt, device)
-    train_ld, test_ld = build_eval_loaders(data_dir=args.data_dir, batch_size=512, num_workers=4)
+    train_ld, test_ld = CIFAR10BYOLClientData.build_eval_loaders(data_dir=args.data_dir, batch_size=512, num_workers=4)
 
     # Extract frozen features once (encoder is fixed during linear eval).
     train_feats, train_labels = extract_feats(model, train_ld, device, normalize=False)

@@ -16,8 +16,8 @@ from torch.utils.data import TensorDataset, DataLoader
 from torchvision import datasets, transforms as T
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
-from dataloader import build_eval_loaders
-#from dataloader import build_server_eval_loaders
+from dataloader import CIFAR10BYOLClientData, TinyImageNetBYOLClientData
+
 import numpy as np
 from typing import List
 from attacks import Loki, LokiConfig
@@ -235,7 +235,8 @@ class FedEMAStrategy(fl.server.strategy.FedAvg):
         return params_agg, metrics_agg
 
 class FedEMAStrategyWithKnn(FedEMAStrategy):
-    def __init__(self, data_dir="./data", k=200, temperature=0.1, eval_model=None,
+    def __init__(self, data_dir="./data", dataset: str = "cifar10",
+                 k=200, temperature=0.1, eval_model=None,
                  loki_config: Optional[LokiConfig] = None, loki_enabled: bool = False,
                  loki_target_cid: int = 0, loki_extract_all: bool = False,
                  loki_save_fragments: bool = True,
@@ -278,21 +279,10 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         # Same encoder architecture as the clients’ encoder
         self.eval_model = eval_model
 
-        self.train_ld, self.test_ld = build_eval_loaders(
+        _eval_cls = TinyImageNetBYOLClientData if dataset == "tiny_imagenet" else CIFAR10BYOLClientData
+        self.train_ld, self.test_ld = _eval_cls.build_eval_loaders(
             data_dir=data_dir, batch_size=128, num_workers=1
         )
-        #self.label_ld, self.eval_ld = build_server_eval_loaders(
-        #    data_dir=data_dir,
-        #    batch_size=512,
-        #    num_workers=4,
-        #    num_clients=6,   # or pass explicitly via your config
-        #    server_cid=5,
-        #    classes_per_client=10,
-            #seed=kwargs.get("seed", 12345),
-        #    non_iid=False,  # recommended False for 10/class
-        #    labeled_per_class=10,
-        #    eval_on_remaining_train_plus_test=True,       # "whole rest of CIFAR-10"
-        #)
         sd = self.eval_model.state_dict()
         self.enc_div_indices: List[int] = []
         idx = 0

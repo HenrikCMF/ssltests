@@ -1,8 +1,11 @@
 data/*.tar.gz
+data/*.zip
 data/cifar-100-python/
+data/tiny-imagenet-200/
 *.pth
 *.txt
 *.pt
 *.pkl
 *.png
 *.csv
+*.zip

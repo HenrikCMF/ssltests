@@ -49,7 +49,6 @@ class SimpleBYOL:
         local_epochs: int = 1,
         dataset_len: int = 0,
         total_rounds: int = 100,
-        model_parallel: bool = False,
     ):
         if torch.cuda.is_available():
             device = "cuda"
@@ -60,14 +59,6 @@ class SimpleBYOL:
         self.device = device
         self.online_device = device
         self.target_device = device
-        if model_parallel and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
-            by_mem = sorted(
-                range(torch.cuda.device_count()),
-                key=lambda i: torch.cuda.get_device_properties(i).total_memory,
-            )
-            self.target_device = f"cuda:{by_mem[0]}"     # smallest GPU
-            self.online_device = f"cuda:{by_mem[-1]}"    # largest GPU
-        self.model_parallel = self.online_device != self.target_device
     
         self.use_amp = True
 

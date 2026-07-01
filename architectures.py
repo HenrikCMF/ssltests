@@ -72,19 +72,12 @@ class ResNet18Projv3(nn.Module):
         super().__init__()
         self.backbone = CIFARResNet18Backbone()
 
-        # Paper: "replace last linear with a two-layer MLP, same as predictor"
-        #self.proj = nn.Sequential(
-        #    nn.Linear(512, 4096, bias=True), #Should possibly be True
-        #    nn.BatchNorm1d(4096),
-        #    nn.ReLU(inplace=True),
-        #    nn.Linear(4096, emb_dim, bias=False),
-        #)
         self.proj = nn.Sequential(
             nn.Linear(512, 4096),
             nn.BatchNorm1d(4096),
             nn.ReLU(inplace=True),
-            nn.Linear(4096, emb_dim),#Maybe False
-            #nn.BatchNorm1d(emb_dim, affine=False)
+            nn.Linear(4096, emb_dim),
+
         )
 
     def forward(self, x, normalize=False):

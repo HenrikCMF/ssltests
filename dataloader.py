@@ -298,162 +298,466 @@ class CIFAR10BYOLClientData:
         """
         return self.train_loader, self.val_loader
 
+    @staticmethod
+    def build_eval_loaders(data_dir="./data", batch_size=512, num_workers=2):
+        tfm = T.Compose([
+            T.Resize(32),
+            T.CenterCrop(32),
+            T.ToTensor(),
+            T.Normalize(mean=(0.4914, 0.4822, 0.4465),
+                        std=(0.2470, 0.2435, 0.2616)),
+        ])
+        train_ds = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
+        test_ds  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=tfm)
+        train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+        test_ld  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+        return train_ld, test_ld
 
-def build_eval_loaders(data_dir="./data", batch_size=512, num_workers=2):
-    tfm = T.Compose([
-        T.Resize(32),
-        T.CenterCrop(32),
-        T.ToTensor(),
-        T.Normalize(mean=(0.4914, 0.4822, 0.4465),
-                    std=(0.2470, 0.2435, 0.2616)),
-    ])
-    train_ds = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
-    test_ds  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=tfm)
-    train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
-    test_ld  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
-    return train_ld, test_ld
+    @staticmethod
+    def partition_indices_like_clients(
+        targets,
+        n: int,
+        num_clients: int,
+        cid: int,
+        classes_per_client: int,
+        seed: int = 12345,
+        non_iid: bool = True,
+    ):
+        if (not non_iid) or (classes_per_client == 10):
+            gen = torch.Generator().manual_seed(seed)
+            perm = torch.randperm(n, generator=gen)
+            shard_size = n // num_clients
+            start = cid * shard_size
+            end = (cid + 1) * shard_size if cid < num_clients - 1 else n
+            return perm[start:end].tolist()
 
+        labels = np.asarray(targets)
+        num_classes = len(np.unique(labels))
 
-def partition_indices_like_clients(
-    targets,
-    n: int,
-    num_clients: int,
-    cid: int,
-    classes_per_client: int,
-    seed: int = 12345,
-    non_iid: bool = True,
-):
-    """
-    Standalone version of CIFAR10BYOLClientData._partition_indices so the server can reuse it.
-    Mirrors the logic in CIFAR10BYOLClientData._partition_indices.  [2](https://aaudk-my.sharepoint.com/personal/st28xu_es_aau_dk/Documents/Microsoft%20Copilot%20Chat%20Files/dataloader.py)
-    """
-    if (not non_iid) or (classes_per_client == 10):
-        gen = torch.Generator().manual_seed(seed)
-        perm = torch.randperm(n, generator=gen)
-        shard_size = n // num_clients
-        start = cid * shard_size
-        end = (cid + 1) * shard_size if cid < num_clients - 1 else n
-        return perm[start:end].tolist()
+        total_sets = num_clients * classes_per_client
+        shards_per_class = int(np.ceil(total_sets / num_classes))
 
-    labels = np.asarray(targets)
-    num_classes = len(np.unique(labels))
+        all_shards = []
+        rng = np.random.default_rng(seed)
+        for cls in range(num_classes):
+            cls_idx = np.where(labels == cls)[0]
+            rng.shuffle(cls_idx)
+            shard_size = len(cls_idx) // shards_per_class
+            remainder = len(cls_idx) % shards_per_class
+            pos = 0
+            for i in range(shards_per_class):
+                extra = 1 if i < remainder else 0
+                shard_end = pos + shard_size + extra
+                shard = cls_idx[pos:shard_end].tolist()
+                all_shards.append(shard)
+                pos = shard_end
 
-    total_sets = num_clients * classes_per_client
-    shards_per_class = int(np.ceil(total_sets / num_classes))
+        rng = np.random.default_rng(seed)
+        rng.shuffle(all_shards)
 
-    all_shards = []
-    rng = np.random.default_rng(seed)
-    for cls in range(num_classes):
-        cls_idx = np.where(labels == cls)[0]
-        rng.shuffle(cls_idx)
-        shard_size = len(cls_idx) // shards_per_class
-        remainder = len(cls_idx) % shards_per_class
-        pos = 0
-        for i in range(shards_per_class):
-            extra = 1 if i < remainder else 0
-            shard_end = pos + shard_size + extra
-            shard = cls_idx[pos:shard_end].tolist()
-            all_shards.append(shard)
-            pos = shard_end
+        start_shard = cid * classes_per_client
+        end_shard = start_shard + classes_per_client
+        client_shards = all_shards[start_shard:end_shard]
 
-    rng = np.random.default_rng(seed)
-    rng.shuffle(all_shards)
+        client_indices = []
+        for shard in client_shards:
+            client_indices.extend(shard)
 
-    start_shard = cid * classes_per_client
-    end_shard = start_shard + classes_per_client
-    client_shards = all_shards[start_shard:end_shard]
+        random.seed(seed + cid)
+        random.shuffle(client_indices)
+        return client_indices
 
-    client_indices = []
-    for shard in client_shards:
-        client_indices.extend(shard)
+    @staticmethod
+    def build_server_eval_loaders(
+        data_dir: str = "./data",
+        batch_size: int = 512,
+        num_workers: int = 2,
+        num_clients: int = 10,
+        server_cid: int = 0,
+        classes_per_client: int = 10,
+        seed: int = 12345,
+        non_iid: bool = False,
+        labeled_per_class: int = 10,
+        eval_on_remaining_train_plus_test: bool = True,
+    ):
+        """
+        Returns:
+          label_ld: loader over labeled examples (labeled_per_class per class) drawn from server split.
+          eval_ld: loader over "the rest of CIFAR-10" (either test only, or remaining train + test).
+        """
+        tfm = T.Compose([
+            T.Resize(32),
+            T.CenterCrop(32),
+            T.ToTensor(),
+            T.Normalize(mean=(0.4914, 0.4822, 0.4465),
+                        std=(0.2470, 0.2435, 0.2616)),
+        ])
 
-    random.seed(seed + cid)
-    random.shuffle(client_indices)
-    return client_indices
+        full_train = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
+        full_test  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=tfm)
 
-
-def build_server_eval_loaders(
-    data_dir: str = "./data",
-    batch_size: int = 512,
-    num_workers: int = 2,
-    # server split config
-    num_clients: int = 10,
-    server_cid: int = 0,
-    classes_per_client: int = 10,
-    seed: int = 12345,
-    non_iid: bool = False,
-    # label budget
-    labeled_per_class: int = 10,
-    # what to evaluate on
-    eval_on_remaining_train_plus_test: bool = True,
-):
-    """
-    Returns:
-      label_ld: loader over 100 labeled examples (10 per class) drawn from server split.
-      eval_ld: loader over "the rest of CIFAR-10" (either test only, or remaining train + test).
-    """
-    tfm = T.Compose([
-        T.Resize(32),
-        T.CenterCrop(32),
-        T.ToTensor(),
-        T.Normalize(mean=(0.4914, 0.4822, 0.4465),
-                    std=(0.2470, 0.2435, 0.2616)),
-    ])
-
-    full_train = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tfm)
-    full_test  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=tfm)
-
-    # Server "own split" indices (same idea as clients)
-    server_split_idx = partition_indices_like_clients(
-        targets=full_train.targets,
-        n=len(full_train),
-        num_clients=num_clients,
-        cid=server_cid,
-        classes_per_client=classes_per_client,
-        seed=seed,
-        non_iid=non_iid,
-    )
-
-    # Select exactly labeled_per_class per class from server split
-    rng = np.random.default_rng(seed + 999)  # deterministic
-    by_class = {c: [] for c in range(10)}
-    for idx in server_split_idx:
-        y = full_train.targets[idx]
-        by_class[y].append(idx)
-
-    chosen = []
-    missing = []
-    for c in range(10):
-        if len(by_class[c]) < labeled_per_class:
-            missing.append((c, len(by_class[c])))
-            continue
-        pick = rng.choice(by_class[c], size=labeled_per_class, replace=False)
-        chosen.extend(pick.tolist())
-
-    if missing:
-        raise ValueError(
-            "Server split does not contain enough samples for some classes. "
-            f"Need {labeled_per_class}/class, but got: {missing}. "
-            "Fix by setting non_iid=False or classes_per_client=10 for server evaluation."
+        server_split_idx = CIFAR10BYOLClientData.partition_indices_like_clients(
+            targets=full_train.targets,
+            n=len(full_train),
+            num_clients=num_clients,
+            cid=server_cid,
+            classes_per_client=classes_per_client,
+            seed=seed,
+            non_iid=non_iid,
         )
 
-    chosen_set = set(chosen)
+        num_classes = len(set(full_train.targets))
+        rng = np.random.default_rng(seed + 999)
+        by_class = {c: [] for c in range(num_classes)}
+        for idx in server_split_idx:
+            y = full_train.targets[idx]
+            by_class[y].append(idx)
 
-    label_ds = Subset(full_train, chosen)
+        chosen = []
+        missing = []
+        for c in range(num_classes):
+            if len(by_class[c]) < labeled_per_class:
+                missing.append((c, len(by_class[c])))
+                continue
+            pick = rng.choice(by_class[c], size=labeled_per_class, replace=False)
+            chosen.extend(pick.tolist())
 
-    if eval_on_remaining_train_plus_test:
-        remaining_train_idx = [i for i in range(len(full_train)) if i not in chosen_set]
-        remaining_train_ds = Subset(full_train, remaining_train_idx)
-        eval_ds = ConcatDataset([remaining_train_ds, full_test])
-    else:
-        eval_ds = full_test
+        if missing:
+            raise ValueError(
+                "Server split does not contain enough samples for some classes. "
+                f"Need {labeled_per_class}/class, but got: {missing}. "
+                "Fix by setting non_iid=False or classes_per_client=10 for server evaluation."
+            )
 
-    label_ld = DataLoader(label_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    eval_ld  = DataLoader(eval_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        chosen_set = set(chosen)
+        label_ds = Subset(full_train, chosen)
 
-    return label_ld, eval_ld
+        if eval_on_remaining_train_plus_test:
+            remaining_train_idx = [i for i in range(len(full_train)) if i not in chosen_set]
+            remaining_train_ds = Subset(full_train, remaining_train_idx)
+            eval_ds = ConcatDataset([remaining_train_ds, full_test])
+        else:
+            eval_ds = full_test
+
+        label_ld = DataLoader(label_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        eval_ld  = DataLoader(eval_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+        return label_ld, eval_ld
 
 
+
+
+TINY_IMAGENET_MEAN = (0.4802, 0.4481, 0.3975)
+TINY_IMAGENET_STD  = (0.2302, 0.2265, 0.2262)
+TINY_IMAGENET_URL  = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+
+
+class TinyImageNetBYOLClientData:
+    """
+    BYOL client data loader for Tiny ImageNet (200 classes, 64x64 RGB).
+    Downloads and sets up the dataset on first use.
+    """
+
+    def __init__(
+        self,
+        num_clients: int,
+        classes_per_client: int,
+        cid: int,
+        batch_size: int = 128,
+        data_dir: str = "./data",
+        keep_labels: bool = False,
+        num_workers: int = 2,
+        seed: int = 12345,
+        device: str = "cpu",
+        download: bool = True,
+    ):
+        assert 0 <= cid < num_clients, "cid must be in [0, num_clients-1]"
+        self.non_iid = True
+        self.classes_per_client = classes_per_client
+        self.num_clients = num_clients
+        self.cid = cid
+        self.batch_size = batch_size
+        self.data_dir = data_dir
+        self.keep_labels = keep_labels
+        self.num_workers = num_workers
+        self.seed = seed
+        self.download = download
+
+        random.seed(seed)
+        torch.manual_seed(seed)
+
+        self.train_transform = self._build_byol_transform(train=True)
+        self.val_transform   = self._build_byol_transform(train=False)
+
+        if download:
+            TinyImageNetBYOLClientData._setup(data_dir)
+
+        self._prepare_datasets()
+
+        self.pin_memory = device == "cuda"
+        self.train_loader, self.val_loader = self._create_dataloaders()
+
+    @staticmethod
+    def _setup(data_dir: str):
+        """Download and restructure Tiny ImageNet val set if not already done.
+
+        Uses val_annotations.txt presence as the sentinel: once restructuring
+        completes the file is deleted, so this is safe to call multiple times.
+        """
+        import os, zipfile, urllib.request, shutil
+        root = os.path.join(data_dir, "tiny-imagenet-200")
+        zip_path = os.path.join(data_dir, "tiny-imagenet-200.zip")
+
+        if not os.path.isdir(root):
+            if not os.path.isfile(zip_path):
+                print("Downloading Tiny ImageNet (~237 MB)...")
+                urllib.request.urlretrieve(TINY_IMAGENET_URL, zip_path)
+            print("Extracting...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(data_dir)
+
+        val_dir = os.path.join(root, "val")
+        ann_file = os.path.join(val_dir, "val_annotations.txt")
+        if not os.path.isfile(ann_file):
+            return  # already restructured
+
+        print("Restructuring val set...")
+        img_src_dir = os.path.join(val_dir, "images")
+        with open(ann_file) as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                fname, wnid = parts[0], parts[1]
+                dst_dir = os.path.join(val_dir, wnid)
+                os.makedirs(dst_dir, exist_ok=True)
+                dst = os.path.join(dst_dir, fname)
+                # Handle both a fresh extract (val/images/) and a previous bad
+                # run that put files one level too deep (val/<wnid>/images/).
+                for src in [
+                    os.path.join(img_src_dir, fname),
+                    os.path.join(val_dir, wnid, "images", fname),
+                ]:
+                    if os.path.isfile(src):
+                        os.rename(src, dst)
+                        break
+
+        # Remove the now-empty flat images dir and any leftover <wnid>/images/ subdirs.
+        if os.path.isdir(img_src_dir):
+            shutil.rmtree(img_src_dir)
+        for entry in os.scandir(val_dir):
+            if entry.is_dir():
+                nested = os.path.join(entry.path, "images")
+                if os.path.isdir(nested):
+                    shutil.rmtree(nested)
+
+        os.remove(ann_file)
+        print("Tiny ImageNet ready.")
+
+    def _build_byol_transform(self, train: bool):
+        color_jitter = T.ColorJitter(0.8, 0.8, 0.8, 0.2)
+        if train:
+            return T.Compose([
+                T.RandomResizedCrop(64, scale=(0.2, 1.0)),
+                T.RandomHorizontalFlip(),
+                T.RandomApply([color_jitter], p=0.8),
+                T.RandomGrayscale(p=0.2),
+                T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
+                T.ToTensor(),
+                T.Normalize(mean=TINY_IMAGENET_MEAN, std=TINY_IMAGENET_STD),
+            ])
+        else:
+            return T.Compose([
+                T.Resize(64),
+                T.CenterCrop(64),
+                T.ToTensor(),
+                T.Normalize(mean=TINY_IMAGENET_MEAN, std=TINY_IMAGENET_STD),
+            ])
+
+    def _partition_indices(self, targets, n: int,
+                           generator: Optional[torch.Generator] = None):
+        """Partition n indices for this client using the same shard logic as CIFAR-10."""
+        if not self.non_iid:
+            if generator is None:
+                generator = torch.Generator().manual_seed(self.seed)
+            perm = torch.randperm(n, generator=generator)
+            shard_size = n // self.num_clients
+            start = self.cid * shard_size
+            end = (self.cid + 1) * shard_size if self.cid < self.num_clients - 1 else n
+            return perm[start:end].tolist()
+
+        labels = np.asarray(targets)
+        num_classes = len(np.unique(labels))
+        total_sets = self.num_clients * self.classes_per_client
+        shards_per_class = int(np.ceil(total_sets / num_classes))
+
+        all_shards = []
+        rng = np.random.default_rng(self.seed)
+        for cls in range(num_classes):
+            cls_idx = np.where(labels == cls)[0]
+            rng.shuffle(cls_idx)
+            shard_size = len(cls_idx) // shards_per_class
+            remainder = len(cls_idx) % shards_per_class
+            pos = 0
+            for i in range(shards_per_class):
+                extra = 1 if i < remainder else 0
+                shard_end = pos + shard_size + extra
+                all_shards.append(cls_idx[pos:shard_end].tolist())
+                pos = shard_end
+
+        rng = np.random.default_rng(self.seed)
+        rng.shuffle(all_shards)
+
+        start_shard = self.cid * self.classes_per_client
+        client_indices = [
+            idx
+            for shard in all_shards[start_shard: start_shard + self.classes_per_client]
+            for idx in shard
+        ]
+        random.seed(self.seed + self.cid)
+        random.shuffle(client_indices)
+        return client_indices
+
+    def _prepare_datasets(self):
+        import os
+        root = os.path.join(self.data_dir, "tiny-imagenet-200")
+        full_train = datasets.ImageFolder(os.path.join(root, "train"))
+        full_val   = datasets.ImageFolder(os.path.join(root, "val"))
+
+        train_targets = [s[1] for s in full_train.samples]
+        val_targets   = [s[1] for s in full_val.samples]
+
+        gen_train = torch.Generator().manual_seed(self.seed)
+        gen_val   = torch.Generator().manual_seed(self.seed + 1)
+
+        train_idx = self._partition_indices(train_targets, len(full_train), generator=gen_train)
+        val_idx   = self._partition_indices(val_targets,   len(full_val),   generator=gen_val)
+
+        self.client_train_byol = BYOLPairDataset(
+            Subset(full_train, train_idx),
+            transform=self.train_transform,
+            keep_labels=self.keep_labels,
+        )
+        self.client_val_byol = BYOLPairDataset(
+            Subset(full_val, val_idx),
+            transform=self.val_transform,
+            keep_labels=self.keep_labels,
+        )
+
+    def _create_dataloaders(self):
+        train_loader = DataLoader(
+            self.client_train_byol,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            persistent_workers=False,
+            pin_memory=self.pin_memory,
+            drop_last=True,
+            prefetch_factor=4,
+        )
+        val_loader = DataLoader(
+            self.client_val_byol,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=False,
+        )
+        return train_loader, val_loader
+
+    def get_loaders(self) -> Tuple[DataLoader, DataLoader]:
+        return self.train_loader, self.val_loader
+
+    @staticmethod
+    def build_eval_loaders(data_dir="./data", batch_size=512, num_workers=2):
+        import os
+        TinyImageNetBYOLClientData._setup(data_dir)
+        root = os.path.join(data_dir, "tiny-imagenet-200")
+        tfm = T.Compose([
+            T.Resize(64),
+            T.CenterCrop(64),
+            T.ToTensor(),
+            T.Normalize(mean=TINY_IMAGENET_MEAN, std=TINY_IMAGENET_STD),
+        ])
+        train_ds = datasets.ImageFolder(os.path.join(root, "train"), transform=tfm)
+        val_ds   = datasets.ImageFolder(os.path.join(root, "val"),   transform=tfm)
+        train_ld = DataLoader(train_ds, batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=False)
+        val_ld   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=False)
+        return train_ld, val_ld
+
+    @staticmethod
+    def build_server_eval_loaders(
+        data_dir: str = "./data",
+        batch_size: int = 512,
+        num_workers: int = 2,
+        num_clients: int = 10,
+        server_cid: int = 0,
+        classes_per_client: int = 200,
+        seed: int = 12345,
+        non_iid: bool = False,
+        labeled_per_class: int = 5,
+        eval_on_remaining_train_plus_test: bool = True,
+    ):
+        """
+        Returns:
+          label_ld: labeled examples (labeled_per_class per class) from server split.
+          eval_ld: remaining train + val (or val only).
+        """
+        import os
+        TinyImageNetBYOLClientData._setup(data_dir)
+        root = os.path.join(data_dir, "tiny-imagenet-200")
+        tfm = T.Compose([
+            T.Resize(64),
+            T.CenterCrop(64),
+            T.ToTensor(),
+            T.Normalize(mean=TINY_IMAGENET_MEAN, std=TINY_IMAGENET_STD),
+        ])
+        full_train = datasets.ImageFolder(os.path.join(root, "train"), transform=tfm)
+        full_val   = datasets.ImageFolder(os.path.join(root, "val"),   transform=tfm)
+
+        train_targets = [s[1] for s in full_train.samples]
+        server_split_idx = CIFAR10BYOLClientData.partition_indices_like_clients(
+            targets=train_targets,
+            n=len(full_train),
+            num_clients=num_clients,
+            cid=server_cid,
+            classes_per_client=classes_per_client,
+            seed=seed,
+            non_iid=non_iid,
+        )
+
+        num_classes = len(full_train.classes)
+        rng = np.random.default_rng(seed + 999)
+        by_class = {c: [] for c in range(num_classes)}
+        for idx in server_split_idx:
+            by_class[train_targets[idx]].append(idx)
+
+        chosen, missing = [], []
+        for c in range(num_classes):
+            if len(by_class[c]) < labeled_per_class:
+                missing.append((c, len(by_class[c])))
+                continue
+            pick = rng.choice(by_class[c], size=labeled_per_class, replace=False)
+            chosen.extend(pick.tolist())
+
+        if missing:
+            raise ValueError(
+                f"Server split missing samples for some classes: {missing}. "
+                "Set non_iid=False or increase classes_per_client."
+            )
+
+        chosen_set = set(chosen)
+        label_ds = Subset(full_train, chosen)
+
+        if eval_on_remaining_train_plus_test:
+            remaining = [i for i in range(len(full_train)) if i not in chosen_set]
+            eval_ds = ConcatDataset([Subset(full_train, remaining), full_val])
+        else:
+            eval_ds = full_val
+
+        label_ld = DataLoader(label_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        eval_ld  = DataLoader(eval_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        return label_ld, eval_ld
 
 
 if __name__ == "__main__":
