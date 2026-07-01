@@ -90,9 +90,11 @@ class FedClient(fl.client.NumPyClient):
         # Linear LR scaling rule (BYOL): lr grows with batch size off a
         # reference of BYOL_REF_BATCH, so larger batches stay well-tuned.
         byol_lr = byol_base_lr * batch_size / BYOL_REF_BATCH
+        loki_image_shape = (3, 64, 64) if dataset == "tiny_imagenet" else (3, 32, 32)
         model, ema, predictor = build_models(
             emb_dim=embedding_size,
             loki=self.loki,
+            loki_image_shape=loki_image_shape,
             loki_fc_size=self.loki_fc_size,
             loki_num_kernels=self.loki_num_kernels,
         )
