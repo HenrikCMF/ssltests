@@ -95,7 +95,7 @@ def sd_float_arrays_bn(module):
 # Build the initial global parameters from the same architecture the clients use,
 # so the encoder/head split broadcast in round 1 matches each client's trainer.
 _tmp, _ema, tmp_pred = build_models(
-    emb_dim=EMBEDDING_SIZE, loki=LOKI_ATTACK,
+    emb_dim=EMBEDDING_SIZE, loki=LOKI_ATTACK, loki_image_shape=_image_shape,
     loki_fc_size=LOKI_FC_SIZE, loki_num_kernels=LOKI_NUM_KERNELS,
 )
 init_nds = sd_float_arrays(_tmp) + sd_float_arrays(tmp_pred)
