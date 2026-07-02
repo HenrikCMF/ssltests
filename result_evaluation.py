@@ -11,9 +11,11 @@ Paper protocol:
     512-d).
   - Train a single new fully-connected layer on top of the frozen features for
     200 epochs, batch size 512, Adam, lr 3e-3.
-  - Report top-1 accuracy on the CIFAR-10 test set.
+  - Report top-1 accuracy on the test set. Number of classes is inferred from
+    the labels, so CIFAR-10 (10) and Tiny ImageNet (200) both work.
 
-Run:  python result_evaluation.py
+Run:  python result_evaluation.py --dataset cifar10
+      python result_evaluation.py --dataset tiny_imagenet
 """
 import argparse
 import torch
@@ -22,10 +24,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from architectures import ResNet18Projv3
-from dataloader import CIFAR10BYOLClientData
+from dataloader import CIFAR10BYOLClientData, TinyImageNetBYOLClientData
 
 EMBEDDING_SIZE = 2048          # must match training (FedEMA_run.py)
 CKPT = "eval_model.pth"
+
+# dataset -> (loader class, paper linear-eval baseline string or None)
+DATASETS = {
+    "cifar10":       (CIFAR10BYOLClientData,       "Paper FedBYOL linear eval (CIFAR-10)    : 79.44%"),
+    "tiny_imagenet": (TinyImageNetBYOLClientData,  None),
+}
 
 
 def load_encoder(ckpt_path, device):
@@ -33,6 +41,11 @@ def load_encoder(ckpt_path, device):
     sd = torch.load(ckpt_path, map_location="cpu")
     if isinstance(sd, dict) and "state_dict" in sd and not any(k.startswith("backbone") for k in sd):
         sd = sd["state_dict"]
+    # A LOKI-armed eval model is a LokiEncoder: benign weights live under the
+    # `net.` submodule, prefixed by the trap's `loki.*` params. Linear eval only
+    # needs the benign backbone, so strip `net.` and drop the trap keys.
+    if any(k.startswith("net.") for k in sd):
+        sd = {k[len("net."):]: v for k, v in sd.items() if k.startswith("net.")}
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing:
         print(f"[warn] missing keys when loading {ckpt_path}: {missing}")
@@ -104,6 +117,7 @@ def linear_probe(train_feats, train_labels, test_feats, test_labels, device,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
+    ap.add_argument("--dataset", default="cifar10", choices=sorted(DATASETS))
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--batch-size", type=int, default=512)
@@ -111,10 +125,11 @@ def main():
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device} | checkpoint: {args.ckpt}")
+    print(f"device: {device} | checkpoint: {args.ckpt} | dataset: {args.dataset}")
 
+    loader_cls, paper_baseline = DATASETS[args.dataset]
     model = load_encoder(args.ckpt, device)
-    train_ld, test_ld = CIFAR10BYOLClientData.build_eval_loaders(data_dir=args.data_dir, batch_size=512, num_workers=4)
+    train_ld, test_ld = loader_cls.build_eval_loaders(data_dir=args.data_dir, batch_size=512, num_workers=4)
 
     # Extract frozen features once (encoder is fixed during linear eval).
     train_feats, train_labels = extract_feats(model, train_ld, device, normalize=False)
@@ -135,7 +150,8 @@ def main():
     print("\n" + "=" * 56)
     print(f"  Linear eval top-1 (raw feats)          : {acc_raw*100:5.2f}%")
     print(f"  Linear eval top-1 (standardized feats) : {acc_std*100:5.2f}%")
-    print(f"  Paper FedBYOL linear eval (CIFAR-10)    : 79.44%")
+    if paper_baseline is not None:
+        print(f"  {paper_baseline}")
     print("=" * 56)
 
 
