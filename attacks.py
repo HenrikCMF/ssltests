@@ -501,6 +501,20 @@ class Loki:
         frags = (rows / mass.clamp_min(1e-12).unsqueeze(1)).view(-1, self.set_size, self.H, self.W)
         return frags, mass
 
+    def bin_mass(self, weight_grad: torch.Tensor, target_cid: int) -> torch.Tensor:
+        """Per-bin Eq.9 normalizer (max-abs of each de-aggregated source row) WITHOUT
+        materializing the fragments -- the denominator `reconstruct` divides by.
+
+        Same rows as `reconstruct`/`reconstruct_with_fired`, but only the amax is
+        kept, so no multi-GB fragment tensor is built (matters on the memory-tight
+        server). Paired with the client's logged DP eff.abs.noise_std it fixes the
+        sandbox LEAK_NOISE (reconstruction_test.dp_noise_to_leak_noise)."""
+        g = weight_grad.detach().to(self.device)
+        block = g[:, self._client_block(target_cid)]
+        elems = self.set_size * self.H * self.W
+        rows = block[:, :elems] if self.cfg.fedavg else (block[:-1, :elems] - block[1:, :elems])
+        return rows.abs().amax(dim=1)                                  # [n]
+
     @staticmethod
     def fired_mask(mass: torch.Tensor, rel_floor: float = 1e-3) -> torch.Tensor:
         """
@@ -719,6 +733,21 @@ class Loki:
         payload = {"frags": kept, "bins": sel.cpu()}
         if counts is not None:
             payload["counts"] = counts.detach().cpu()[sel].long()
+        # Per-fragment bias cutoff. A fragment is dL/dh_i * x_view / max|.| and
+        # dL/dh_i has no fixed sign under a BYOL-style loss, so ~half are saved as
+        # photographic negatives; the downstream min-max maps -x to 1-minmax(x),
+        # a valid-looking image nothing flags. The cutoff is the sign reference
+        # that undoes it: bin i fires only for views whose mean brightness lands
+        # in its band, so sign(cutoff_i) is the sign the fragment mean must have.
+        # This is the server's OWN chosen bias value, not a bias *gradient* (which
+        # secure aggregation destroys, cf. reconstruct_with_fired) — so recording
+        # it assumes nothing the extraction does not already assume.
+        cutoffs = self.cutoffs
+        if cutoffs is not None:
+            if not self.cfg.fedavg:
+                cutoffs = cutoffs[:-1]      # align to the difference fragments
+            if cutoffs.numel() == fragments.shape[0]:
+                payload["cutoffs"] = cutoffs.detach().cpu()[sel].float()
         torch.save(payload, os.path.join(root, f"round_{int(server_round):03d}.pt"))
 
     def save_fragments_by_bin(

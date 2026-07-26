@@ -26,13 +26,14 @@ import torch
 from torchvision.utils import make_grid, save_image
 
 import reconstruction_test as R
+#FRAG_DIR=fragments_clustered MIN_VIEWS=4 RECON_SUBDIR=cluster_recons python infer_fragments.py
 
 # FRAG_DIR / OUT subdir / min-views are env-overridable so the same script can run
 # on the raw leak bins (defaults) or on re-identified clusters from cluster_fragments
 # (e.g. FRAG_DIR=fragments_clustered MIN_VIEWS=4 RECON_SUBDIR=cluster_recons python ...).
 FRAG_DIR    = os.environ.get("FRAG_DIR", "fragments")
 OUT_DIR     = os.path.join(R.OUT_DIR, os.environ.get("RECON_SUBDIR", "fragment_recons"))
-CKPT        = os.path.join(R.OUT_DIR, R.CKPT_NAME)   # follows R.LEAK_VIEWS (best.pt / best_leak.pt)
+CKPT        = os.environ.get("CKPT", "reconstruction_out/best_leak_down_tinyimage_og.pt")   # inverter; env-overridable
 FULL_COUNT  = int(os.environ.get("MIN_VIEWS", "99"))  # min round_*.pt to reconstruct a bin
 MAX_VIEWS   = R.NUM_PERTURB    # cap views fed (the model trains on up to this many)
 BATCH_BINS  = 64               # bins reconstructed per forward pass
@@ -102,7 +103,7 @@ def main():
             reps = (maxn + v.shape[0] - 1) // v.shape[0]
             return v.repeat(reps, 1, 1, 1)[:maxn]
         batch = torch.stack([_pad(v) for v in sets]).to(device)   # [B,maxn,3,32,32]
-        with torch.no_grad(), torch.autocast("cuda", enabled=R.AMP and device.type == "cuda"):
+        with torch.no_grad(), torch.autocast(device.type, enabled=R.AMP and device.type == "cuda"):
             preds = model(batch)                       # [B,3,32,32]
         recons = R.denormalize(preds.float()).cpu()
         for b, views, recon in zip(chunk, sets, recons):

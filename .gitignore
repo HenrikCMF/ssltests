@@ -1,3 +1,6 @@
+__pycache__/
+.vscode/
+dp_sweep_out/
 data/*.tar.gz
 data/*.zip
 data/cifar-100-python/
@@ -9,3 +12,5 @@ data/tiny-imagenet-200/
 *.png
 *.csv
 *.zip
+*.md
+*.log

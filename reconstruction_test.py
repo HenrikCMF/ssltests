@@ -45,7 +45,30 @@ import torchvision.transforms as T
 # ---------------------------------------------------------------------------- #
 DATA_DIR      = "./data"
 CACHE_DIR     = "./recon_cache"
-IMG_SIZE      = 32
+# --- Resolution / source-dataset mode --------------------------------------- #
+# The inverter's TRAINING data is chosen by these toggles. Enable AT MOST one of
+# UPSCALE / DOWNSCALE / SVHN; all off = CIFAR-100 at its native 32x32.
+#   (none)     CIFAR-100, native 32x32.
+#   UPSCALE    CIFAR-100 32x32 LANCZOS-upscaled to UPSCALE_SIZE *before* perturbing.
+#              Targets are band-limited (no genuine detail above 32px), so the inverter
+#              learns to emit smooth ~32px-of-detail images -> blurry 64px recons.
+#   DOWNSCALE  Tiny ImageNet native 64x64 LANCZOS-downscaled to DOWNSCALE_SIZE *before*
+#              perturbing. Targets carry real (decimated, not invented) detail, so the
+#              inverter trains to output crisp small images of true 64px content.
+#   SVHN       SVHN (Street View House Numbers) train split, native 32x32, NO resize. A
+#              source-INDEPENDENT 32px control: SVHN is Google Street View, not the 80M
+#              Tiny Images family CIFAR comes from, so training here and testing on
+#              CIFAR-10/100 probes cross-collection transfer without any resize artifact.
+# Whichever is on, IMG_SIZE drives every downstream array/model automatically.
+UPSCALE        = False
+UPSCALE_SIZE   = 64
+DOWNSCALE      = True
+DOWNSCALE_SIZE = 32
+SVHN           = False        # train the inverter on SVHN (native 32x32, source-independent control)
+assert sum([UPSCALE, DOWNSCALE, SVHN]) <= 1, "enable at most one of UPSCALE / DOWNSCALE / SVHN"
+_RESIZE  = UPSCALE or DOWNSCALE                    # source native size != IMG_SIZE -> LANCZOS resize (SVHN is native 32)
+IMG_SIZE = (UPSCALE_SIZE if UPSCALE else
+            DOWNSCALE_SIZE if DOWNSCALE else 32)   # effective working resolution
 NUM_PERTURB   = 100          # views per original (one LOKI bin's across-round stack)
 GRID          = 10           # NUM_PERTURB must equal GRID*GRID
 TRAIN_FRAC    = 0.999        # 99.9/0.1 split -> ~50 test originals (cheap per-epoch eval)
@@ -67,9 +90,48 @@ DROPOUT       = 0.1          # dropout inside the transformer enc/dec layers
 VIEWS_MIN     = 4
 VIEWS_MAX     = 99
 PERCEPTUAL_W  = 0.1          # weight of the VGG feature-matching term (0 = off); fights blur
+# --- LPIPS training objective ----------------------------------------------- #
+# LPIPS_LOSS trains the inverter on the LPIPS perceptual DISTANCE (Zhang et al. 2018:
+# calibrated linear weights on deep features) instead of the SSIM+VGG combo. A small L1
+# anchor is kept because pure LPIPS lets global colour/brightness drift (LPIPS is
+# near-invariant to it).
+# BACKBONE: use "vgg" at these small resolutions. AlexNet's stride-4 11x11 conv1 leaves
+# almost no feature map at 32px, so its LPIPS dynamic range collapses (independent images
+# score ~0.06, not ~0.5) -> tiny, meaningless distances that look great while recons are
+# bad. VGG's gentle 3x3/stride-1 convs keep ~5x the range at 32px (independent ~0.29) and
+# are the better optimization target. NOTE: compare_cid0 measures with alex@64, so the
+# training LPIPS numbers here are NOT directly comparable to its scores.
+LPIPS_LOSS    = True        # train on LPIPS instead of SSIM+VGG
+LPIPS_NET     = "vgg"        # LPIPS backbone: "vgg" (real range at 32px) or "alex" (collapses <64px)
+LPIPS_W       = 1.0          # weight of the LPIPS term
+LPIPS_L1_W    = 0.1          # L1 anchor weight on colour/low-freq (pure LPIPS drifts there)
 AMP           = True         # mixed precision
+# --- Throughput knobs (pure speed; do not change the training math) ---------- #
+# COMPILE    torch.compile the model. The per-view stem + Transformer fuse well; the
+#            only dynamic axis is the per-step view count N, so we mark_dynamic dim 1
+#            (see call_model) to compile ONCE instead of recompiling for every k.
+# PREFETCH   overlap the CPU memmap view-gather + host->device copy of the NEXT batch
+#            with the current batch's GPU compute (a background thread). The old loader
+#            was fully synchronous -- ~79 MB gathered per step with the GPU idle.
+# DUAL_GPU   data-parallel across cuda:0 (primary, RTX 5090) + cuda:1 (weaker card).
+#            The batch's originals are split UNEVENLY -- GPU1 gets GPU1_FRAC of them --
+#            because cuda:1 is far slower; giving it a small shard keeps it from being
+#            the straggler the step waits on, and offloading that shard also frees VRAM
+#            on cuda:0. Grads from the two shards are combined size-weighted (so it is
+#            the exact same gradient as one big batch) on cuda:0, the single optimizer
+#            steps there, and the updated weights are copied back to the replica. Only
+#            cuda:0's model is ever checkpointed/evaluated.
+COMPILE       = True
+PREFETCH      = True
+# DUAL_GPU measured a NET LOSS on this box (RTX 5090 + RTX 4060 Ti): the 4060 Ti is ~6x
+# slower and sits on PCIe 4.0 x8, so the per-step grad+weight sync (~308 MB ~19 ms) plus
+# its oversized shard-time outweigh its compute contribution -- GPU0 dropped to ~50% util
+# and the epoch got slower. Left as an off-by-default toggle; the win here is compile +
+# prefetch on the 5090 alone. Only revisit dual with a closely-matched second GPU.
+DUAL_GPU      = False
+GPU1_FRAC     = 0.20         # fraction of each batch's originals sent to the weaker GPU1 (if DUAL_GPU)
 PRECOMPUTE_WORKERS = 24
-FORCE_PRECOMPUTE = False     # ignore cache and regenerate the views
+FORCE_PRECOMPUTE = True     # ignore cache and regenerate the views
 SEED          = 12345
 MODEL         = "settr"      # "settr" (view=token transformer), "set", or "cnn"
 OUT_DIR       = "reconstruction_out"
@@ -87,11 +149,72 @@ OUT_DIR       = "reconstruction_out"
 # NOTE: domain-randomizing these per step with GAUSSIAN noise was tried and reverted
 # -- it lifted oracle clusters (+4.7) but REGRESSED the real pipeline (24->21%); the
 # real corruption is binning blends / few-view, not gaussian. See FINDINGS.md.
+# UPDATE: that premise no longer holds once the federated run uses DP_MODE. DP injects
+# a genuinely Gaussian perturbation into the transmitted update (client._apply_dp), so
+# the real fragments now carry Gaussian corruption on TOP of the binning/few-view kind.
+# LEAK_NOISE below is re-enabled to ~match that DP noise. It is NOT equal to DP_NOISE:
+# DP_NOISE (sigma) is a RELATIVE fraction of a layer's update norm, whereas LEAK_NOISE is
+# an ABSOLUTE std in the Eq.9 max-abs-1 fragment space. The link (see dp_noise_to_leak_noise
+# below) goes through the FC1 WEIGHT update LOKI reads -- its RMS fc1w_rms and the Eq.9
+# per-bin normalizer m_fired:
+#   LEAK_NOISE ~= sqrt(K) * sigma * fc1w_rms / median(m_fired).
+# CAUTION: do NOT use the client's logged "eff.abs.noise_std" (~430) here -- that is the
+# dominant-NORM layer (FC1 bias/conv), a DIFFERENT layer LOKI never reconstructs from.
+# fc1w_rms and m_fired are both logged by a real DP round (server LOKI reconstruct line).
+# m_fired spans ~100x across bins, so one scalar LEAK_NOISE matches only the median bin;
+# SWEEP around the computed value and judge by real-fragment recon.
 LEAK_VIEWS    = True         # train/eval on LOKI-leak-style views (match real fragments)
-LEAK_NOISE    = 0.0           # additive noise std (model-input units) injected pre-to_unit
+LEAK_NOISE    = 0.14          # ~matches DP_NOISE=0.05; sweep {0.02,0.05,0.1} pre-to_unit
 LEAK_CONTAM_P = 0.0           # per-view prob. of blending a decoy view (bin contamination)
 LEAK_CONTAM_A = 0.5           # decoy blend weight when a view is contaminated
-CKPT_NAME     = "best_leak.pt" if LEAK_VIEWS else "best.pt"   # don't clobber the clean ckpt
+
+
+def dp_noise_to_leak_noise(sigma, fc1w_rms, m_fired, num_clients=1):
+    """Convert a real DP run's FC1-weight noise into the equivalent sandbox LEAK_NOISE.
+
+    Maps the weight-space DP perturbation (client._apply_dp) to the image-space
+    LEAK_NOISE applied in leak_views, so both land the same noise-to-signal ratio
+    on the pre-to_unit fragment that LOKI's Eq.9 produces.
+
+    IMPORTANT: this must use the FC1 *weight* layer LOKI reconstructs from, NOT the
+    client's logged "eff.abs.noise_std". That log is for the dominant-NORM layer
+    (the FC1 bias / conv, d=fc_size) -- a *different* layer LOKI never reads, whose
+    absolute noise (~430) is unrelated to the weight-gradient signal.
+
+    Args:
+      sigma    : DP_NOISE, the per-layer relative noise fraction (e.g. 0.1).
+      fc1w_rms : RMS of the FC1 WEIGHT update = ||upd_w|| / sqrt(numel). The DP
+                 noise on this layer had absolute per-coord std ~= sigma * fc1w_rms.
+                 Printed by the server LOKI reconstruct line as "fc1w_rms".
+      m_fired  : Eq.9 per-bin normalizer = max-abs of a fired bin's weight-update
+                 row (use the MEDIAN over fired bins, "m_fired median" in the log).
+                 reconstruct() divides each row by this, so the clean fragment has
+                 max-abs 1 and the noise std becomes (sigma*fc1w_rms)/m_fired there.
+      num_clients: K participating clients per round. Each adds independent noise
+                 into every column LOKI reads while the de-aggregated signal is one
+                 client's, so summed noise std ~ sqrt(K) * (sigma*fc1w_rms).
+
+    Returns the LEAK_NOISE matching the MEDIAN fired bin. Because m_fired spans
+    ~100x across bins, dim bins see far more relative noise than this and bright
+    bins far less -- a single scalar LEAK_NOISE cannot capture that spread, which
+    is itself a reason sandbox<->DP results diverge.
+    """
+    import math
+    if m_fired <= 0:
+        raise ValueError("m_fired must be > 0 (no fired bins?)")
+    return math.sqrt(num_clients) * sigma * fc1w_rms / m_fired
+# Client augmentation-strength toggle. MUST match the STRONG_AUG flag of the
+# federated run whose fragments will be inverted: it ~doubles the perturbation
+# strength of PRECOMPUTE_TF (see below) so the inverter trains on the exact view
+# distribution the real clients produce. Strong/weak views and checkpoints are
+# kept in separate files (via _AUG_TAG) so flipping this never clobbers the other.
+STRONG_AUG    = False
+_RES_TAG      = (f"_up{IMG_SIZE}" if UPSCALE else              # keep each mode's ckpt/cache
+                 f"_down{IMG_SIZE}" if DOWNSCALE else            # files separate & non-clobbering
+                 f"_svhn{IMG_SIZE}" if SVHN else "")
+_LOSS_TAG     = "_lpips" if LPIPS_LOSS else ""                  # keep LPIPS-trained ckpts separate
+_AUG_TAG      = "_strong" if STRONG_AUG else ""                # strong-aug views/ckpts kept separate
+CKPT_NAME     = ("best_leak" if LEAK_VIEWS else "best") + _RES_TAG + _LOSS_TAG + _AUG_TAG + ".pt"  # don't clobber others
 
 # CIFAR normalization (must match the federated pipeline exactly).
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
@@ -102,28 +225,58 @@ assert GRID * GRID == NUM_PERTURB, "NUM_PERTURB must be a perfect square == GRID
 # Exact client augmentation MINUS the final ToTensor/Normalize. We keep the output
 # as a uint8 PIL image (same pixels the client feeds ToTensor) and do /255 +
 # normalize on the GPU -- mathematically identical to ToTensor()+Normalize().
-_COLOR_JITTER = T.ColorJitter(0.8, 0.8, 0.8, 0.2)
+#
+# STRONG_AUG (set above) mirrors dataloader.BYOLClientData's toggle exactly, along
+# the same knobs it scales for the CIFAR/CIFAR-100 client path: crop min-scale
+# 0.2->0.1, ColorJitter (0.8,0.8,0.8,0.2)->(1.6,1.6,1.6,0.4), grayscale p 0.2->0.4.
+# Horizontal flip stays at p=0.5. (No GaussianBlur in either mode here, matching
+# this pipeline's existing CIFAR-style transform.)
+if STRONG_AUG:
+    _COLOR_JITTER = T.ColorJitter(1.6, 1.6, 1.6, 0.4)
+    _CROP_MIN_SCALE, _GRAYSCALE_P = 0.1, 0.4
+else:
+    _COLOR_JITTER = T.ColorJitter(0.8, 0.8, 0.8, 0.2)
+    _CROP_MIN_SCALE, _GRAYSCALE_P = 0.2, 0.2
 PRECOMPUTE_TF = T.Compose([
-    T.RandomResizedCrop(IMG_SIZE, scale=(0.2, 1.0)),
+    T.RandomResizedCrop(IMG_SIZE, scale=(_CROP_MIN_SCALE, 1.0)),
     T.RandomHorizontalFlip(),
     T.RandomApply([_COLOR_JITTER], p=0.8),
-    T.RandomGrayscale(p=0.2),
+    T.RandomGrayscale(p=_GRAYSCALE_P),
 ])
 loss_func = nn.MSELoss()
 
 def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 # ---------------------------------------------------------------------------- #
 # PIL view generation (used by both the parallel precompute and the test set)
 # ---------------------------------------------------------------------------- #
+def resize_orig(orig_hwc: np.ndarray) -> np.ndarray:
+    """[H,W,3] uint8 original -> [IMG_SIZE,IMG_SIZE,3] uint8 via LANCZOS (best-quality PIL
+    resample, up or down). Resizes the source before perturbing and builds the matching
+    ground truth the inverter must output. UPSCALE goes 32->64, DOWNSCALE 64->32; a no-op
+    when the source is already IMG_SIZE (plain CIFAR-100)."""
+    from PIL import Image
+    return np.asarray(
+        Image.fromarray(orig_hwc).resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS),
+        dtype=np.uint8)
+
+
 def pil_views(orig_hwc: np.ndarray, n_pert: int, seed: int) -> np.ndarray:
-    """orig_hwc: [32,32,3] uint8 -> [n_pert,3,32,32] uint8 of bit-exact PIL views."""
+    """orig_hwc: [H,W,3] uint8 -> [n_pert,3,IMG_SIZE,IMG_SIZE] uint8 of bit-exact PIL
+    views. When UPSCALE/DOWNSCALE, the original is LANCZOS-resized to IMG_SIZE *before* the
+    perturbation pipeline runs, so the views live at the working resolution."""
     from PIL import Image
     random.seed(seed)
     torch.manual_seed(seed)
     img = Image.fromarray(orig_hwc)
+    if _RESIZE:
+        img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)   # best-quality LANCZOS resize first
     out = np.empty((n_pert, 3, IMG_SIZE, IMG_SIZE), dtype=np.uint8)
     for k in range(n_pert):
         aug = PRECOMPUTE_TF(img)                       # PIL RGB image
@@ -142,7 +295,7 @@ def _init_worker(raw, train_idx, mmap_path, shape):
 
 
 def _precompute_one(j: int) -> int:
-    orig = _G["raw"][_G["tidx"][j]]                    # [32,32,3] uint8
+    orig = _G["raw"][_G["tidx"][j]]                    # [H,W,3] uint8 (32 CIFAR/SVHN, 64 TinyIN)
     _G["mm"][j] = pil_views(orig, NUM_PERTURB, seed=SEED * 1_000_003 + j)
     return j
 
@@ -151,16 +304,61 @@ def _precompute_one(j: int) -> int:
 # Data: precompute (or load) the view cache; keep originals for ground truth
 # ---------------------------------------------------------------------------- #
 def _cache_meta():
-    return {
+    m = {
         "num_perturb": NUM_PERTURB, "img_size": IMG_SIZE, "seed": SEED,
         "train_frac": TRAIN_FRAC, "train_subset": TRAIN_SUBSET, "version": 1,
+        "upscale": UPSCALE, "upscale_size": UPSCALE_SIZE,
     }
+    if DOWNSCALE:   # kept conditional so existing (non-downscale) caches stay valid
+        m["downscale"], m["downscale_size"], m["source"] = True, DOWNSCALE_SIZE, "tiny_imagenet"
+    if SVHN:        # conditional too, so plain-CIFAR-100 caches keep validating unchanged
+        m["svhn"], m["source"] = True, "svhn"
+    if STRONG_AUG:  # conditional so existing weak-aug caches keep validating unchanged
+        m["strong_aug"] = True
+    return m
+
+
+def origs_to_tensor(hwc_batch: np.ndarray, device) -> torch.Tensor:
+    """[K,H,W,3] uint8 originals -> [K,3,IMG_SIZE,IMG_SIZE] uint8 tensor on device.
+    LANCZOS-resized to IMG_SIZE when UPSCALE/DOWNSCALE, so the ground truth matches the
+    resolution the perturbed views were generated at."""
+    if _RESIZE:
+        hwc_batch = np.stack([resize_orig(o) for o in hwc_batch])
+    return torch.from_numpy(np.ascontiguousarray(hwc_batch)).permute(0, 3, 1, 2).contiguous().to(device)
+
+
+def _load_source_raw() -> np.ndarray:
+    """Source originals as one [N,H,W,3] uint8 array. Plain/UPSCALE -> CIFAR-100 (.data,
+    32px). SVHN -> SVHN train split, native 32px (source-independent control). DOWNSCALE ->
+    Tiny ImageNet train loaded from ImageFolder into a 64px array, cached to disk as .npy so
+    the 100k JPEGs are only read once (order is deterministic: ImageFolder sorts classes and
+    files, and the .npy freezes it for the seeded split)."""
+    if SVHN:
+        # torchvision SVHN stores .data as [N,3,32,32] (CHW); transpose to the [N,H,W,3]
+        # HWC convention every other source and downstream consumer here assumes.
+        data = torchvision.datasets.SVHN(root=DATA_DIR, split="train", download=True).data
+        return np.ascontiguousarray(data.transpose(0, 2, 3, 1))   # [N,32,32,3] uint8
+    if not DOWNSCALE:
+        return torchvision.datasets.CIFAR100(root=DATA_DIR, train=True, download=True).data
+    from PIL import Image
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    raw_cache = os.path.join(CACHE_DIR, "tiny_imagenet_train_raw.npy")
+    if os.path.exists(raw_cache):
+        return np.load(raw_cache)
+    root = os.path.join(DATA_DIR, "tiny-imagenet-200", "train")
+    samples = torchvision.datasets.ImageFolder(root).samples   # [(path, class), ...] sorted
+    print(f"loading {len(samples)} Tiny ImageNet originals (64px, one-time) ...", flush=True)
+    raw = np.empty((len(samples), 64, 64, 3), dtype=np.uint8)
+    for i, (path, _) in enumerate(samples):
+        with Image.open(path) as im:
+            raw[i] = np.array(im.convert("RGB"), dtype=np.uint8)
+    np.save(raw_cache, raw)
+    return raw
 
 
 def build_view_cache(device):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    base = torchvision.datasets.CIFAR100(root=DATA_DIR, train=True, download=True)
-    raw = base.data                                    # [50000,32,32,3] uint8
+    raw = _load_source_raw()                           # [N,H,W,3] uint8 (CIFAR-100 or Tiny ImageNet)
     n = raw.shape[0]
     g = torch.Generator().manual_seed(SEED)
     perm = torch.randperm(n, generator=g).numpy()
@@ -170,8 +368,8 @@ def build_view_cache(device):
         train_idx = train_idx[:TRAIN_SUBSET]
     n_train = len(train_idx)
 
-    mmap_path = os.path.join(CACHE_DIR, "train_views.u8")
-    meta_path = os.path.join(CACHE_DIR, "train_views.json")
+    mmap_path = os.path.join(CACHE_DIR, f"train_views{_RES_TAG}{_AUG_TAG}.u8")
+    meta_path = os.path.join(CACHE_DIR, f"train_views{_RES_TAG}{_AUG_TAG}.json")
     shape = (n_train, NUM_PERTURB, 3, IMG_SIZE, IMG_SIZE)
     meta = _cache_meta(); meta["n_train"] = n_train
 
@@ -197,14 +395,14 @@ def build_view_cache(device):
         print(f"precompute done in {time.time()-t0:.0f}s")
 
     train_views = np.memmap(mmap_path, dtype=np.uint8, mode="r", shape=shape)
-    train_orig = torch.from_numpy(raw[train_idx]).permute(0, 3, 1, 2).contiguous().to(device)
+    train_orig = origs_to_tensor(raw[train_idx], device)
 
     # Test set is tiny (~50 originals) -> precompute its views in-process onto GPU.
     test_orig_np = raw[test_idx]
     test_views = np.stack([pil_views(test_orig_np[i], NUM_PERTURB, seed=SEED + 7 + i)
                            for i in range(len(test_idx))])
-    test_views = torch.from_numpy(test_views).to(device)              # [nt,100,3,32,32] u8
-    test_orig = torch.from_numpy(test_orig_np).permute(0, 3, 1, 2).contiguous().to(device)
+    test_views = torch.from_numpy(test_views).to(device)              # [nt,100,3,IMG,IMG] u8
+    test_orig = origs_to_tensor(test_orig_np, device)
     return train_views, train_orig, test_views, test_orig
 
 
@@ -305,15 +503,15 @@ _VGG_TAPS = (3, 8, 15)        # relu1_2, relu2_2, relu3_3
 
 
 def _vgg_extractor(device):
-    if "feats" not in _VGG:
+    if device not in _VGG:                             # cache PER device (dual-GPU replica needs its own)
         from torchvision.models import VGG16_Weights, vgg16
         feats = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features[:max(_VGG_TAPS) + 1].eval()
         for p in feats.parameters():
             p.requires_grad_(False)
-        _VGG["feats"] = feats.to(device)
-        _VGG["mean"] = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-        _VGG["std"] = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
-    return _VGG["feats"], _VGG["mean"], _VGG["std"]
+        _VGG[device] = (feats.to(device),
+                        torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1),
+                        torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1))
+    return _VGG[device]
 
 
 @torch.autocast("cuda", enabled=False)
@@ -330,12 +528,41 @@ def vgg_perceptual(pred01, gt01):
     return loss
 
 
+# LPIPS perceptual distance (Zhang et al. 2018): calibrated linear weights on top of
+# deep features -- a proper LEARNED perceptual metric, unlike the raw-VGG-feature L1
+# above. Loaded lazily and frozen (we never train its weights); the same net compare_cid0
+# scores with. normalize=True lets it take [0,1] inputs (it rescales to [-1,1] itself).
+_LPIPS = {}
+
+
+def _lpips_model(device):
+    if device not in _LPIPS:                           # cache PER device (dual-GPU replica needs its own)
+        import lpips as _lpips_pkg
+        net = _lpips_pkg.LPIPS(net=LPIPS_NET, verbose=False).to(device).eval()
+        for p in net.parameters():
+            p.requires_grad_(False)                    # freeze: metric, not a trained head
+        _LPIPS[device] = net
+    return _LPIPS[device]
+
+
+@torch.autocast("cuda", enabled=False)
+def lpips_perceptual(pred01, gt01):
+    """pred01, gt01 in [0,1]. Mean LPIPS distance (lower = perceptually closer); gt
+    branch detached. Runs fp32 (autocast off) like the SSIM/VGG terms. Freezing the net
+    stops its weights updating but still lets gradients flow back into pred01."""
+    net = _lpips_model(pred01.device)
+    return net(pred01.float(), gt01.float().detach(), normalize=True).mean()
+
+
 def recon_loss(pred_norm, gt_norm, ssim_w=0.84, vgg_w=PERCEPTUAL_W):
     """Structure (1-SSIM) + low-freq/colour fidelity (L1) + optional VGG perceptual.
     Pure 1-SSIM leaves global colour drift; L1 pins it down; the VGG term rewards
-    matching edges/textures, which counters the blurry mean-seeking of pixel losses."""
+    matching edges/textures, which counters the blurry mean-seeking of pixel losses.
+    LPIPS_LOSS instead trains on the LPIPS distance (+ a small L1 anchor for colour)."""
     p = denormalize(pred_norm.float())
     g = denormalize(gt_norm.float())
+    if LPIPS_LOSS:
+        return LPIPS_W * lpips_perceptual(p, g) + LPIPS_L1_W * F.l1_loss(p, g)
     loss = ssim_w * (1.0 - ssim(p, g, data_range=1.0)) + (1.0 - ssim_w) * F.l1_loss(p, g)
     if vgg_w > 0:
         loss = loss + vgg_w * vgg_perceptual(p, g)
@@ -538,10 +765,89 @@ def fetch_views(train_views, sel_cpu, device):
     return torch.from_numpy(np.ascontiguousarray(arr)).to(device, non_blocking=True)
 
 
+def call_model(model, views, compiled):
+    """Forward, marking the view-count axis (dim 1) dynamic so torch.compile builds
+    ONE graph for the whole [VIEWS_MIN, VIEWS_MAX] spread instead of recompiling per k.
+    The batch and spatial dims are static (full batches, fixed IMG_SIZE), so only dim 1
+    is flagged. No-op semantics when not compiled."""
+    if compiled:
+        torch._dynamo.mark_dynamic(views, 1)
+    return model(views)
+
+
+def make_epoch_plan(n_train, batch, n1):
+    """One epoch's worth of (sel, k, pick) steps, drawn from the SAME RNGs the old inline
+    loop used so training is unchanged: k log-uniform in [VIEWS_MIN, VIEWS_MAX] (python
+    `random`), pick a random view subset (torch). For DUAL_GPU the first `n1` originals of
+    each sel go to the weak GPU1, the rest to GPU0 -- decided here so the prefetcher can
+    ship the two shards straight to their devices."""
+    plan = []
+    for sel in iter_batches(n_train, batch, shuffle=True):
+        hi = min(VIEWS_MAX, NUM_PERTURB)
+        lo = min(max(1, VIEWS_MIN), hi)
+        k = int(round(math.exp(random.uniform(math.log(lo), math.log(hi)))))
+        k = max(lo, min(k, hi))
+        pick = torch.randperm(NUM_PERTURB)[:k].numpy()
+        plan.append((sel, pick))
+    return plan
+
+
+def prepare_batch(train_views, train_orig, sel, pick, dev0, dev1, n1):
+    """Gather the `pick` views for originals `sel` from the CPU memmap and ship them to
+    the GPU(s) as uint8. Single-GPU (dev1 None) -> (v0, gt0, None, None). Dual -> the
+    first n1 originals go to the weak GPU1, the rest to dev0; gt comes from `train_orig`
+    (already on dev0), and gt1 is copied dev0->dev1."""
+    arr = np.ascontiguousarray(train_views[sel.numpy()][:, pick])    # [B,k,3,H,W] u8, subsampled
+    t = torch.from_numpy(arr)
+    if dev1 is None:
+        v0 = t.pin_memory().to(dev0, non_blocking=True)
+        return v0, train_orig[sel.to(dev0)], None, None
+    v1 = t[:n1].contiguous().pin_memory().to(dev1, non_blocking=True)
+    v0 = t[n1:].contiguous().pin_memory().to(dev0, non_blocking=True)
+    gt0 = train_orig[sel[n1:].to(dev0)]
+    gt1 = train_orig[sel[:n1].to(dev0)].to(dev1)
+    return v0, gt0, v1, gt1
+
+
+class CudaPrefetcher:
+    """Runs prepare_batch for the NEXT step in a background thread so the CPU memmap
+    gather + host->device copy overlaps the current step's GPU compute. The loader was
+    fully synchronous before -- ~79 MB gathered per step with the GPU idle. Iterating
+    yields the same (v0, gt0, v1, gt1) tuples prepare_batch returns."""
+    def __init__(self, train_views, train_orig, plan, dev0, dev1, n1):
+        from concurrent.futures import ThreadPoolExecutor
+        self.tv, self.torig, self.plan = train_views, train_orig, plan
+        self.dev0, self.dev1, self.n1 = dev0, dev1, n1
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self.i = 0
+        self.fut = self.pool.submit(self._load, 0) if plan else None
+
+    def _load(self, idx):
+        sel, pick = self.plan[idx]
+        return prepare_batch(self.tv, self.torig, sel, pick, self.dev0, self.dev1, self.n1)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.fut is None:
+            raise StopIteration
+        out = self.fut.result()
+        self.i += 1
+        self.fut = self.pool.submit(self._load, self.i) if self.i < len(self.plan) else None
+        return out
+
+    def close(self):
+        self.pool.shutdown(wait=False)
+
+
 @torch.no_grad()
 def evaluate(model, gm, test_views, test_orig, device):
+    """Mean test SSIM (always) plus mean test LPIPS when LPIPS_LOSS is on. Returns
+    (ssim, lpips); lpips is None unless LPIPS_LOSS, so checkpointing can select on the
+    objective it actually trained (lowest LPIPS) rather than SSIM."""
     model.eval()
-    total, seen = 0.0, 0
+    ssim_sum, lpips_sum, seen = 0.0, 0.0, 0
     n = test_views.shape[0]
     for i in range(0, n, BATCH_SIZE):
         vb = test_views[i:i + BATCH_SIZE]
@@ -549,9 +855,13 @@ def evaluate(model, gm, test_views, test_orig, device):
         gt = gm.norm(test_orig[i:i + BATCH_SIZE])
         with torch.autocast("cuda", enabled=AMP and device.type == "cuda"):
             pred = model(views)
-        total += float(ssim(denormalize(pred.float()), denormalize(gt), data_range=1.0)) * vb.shape[0]
+        p01, g01 = denormalize(pred.float()), denormalize(gt)
+        ssim_sum += float(ssim(p01, g01, data_range=1.0)) * vb.shape[0]
+        if LPIPS_LOSS:
+            lpips_sum += float(lpips_perceptual(p01, g01)) * vb.shape[0]
         seen += vb.shape[0]
-    return total / max(1, seen)
+    seen = max(1, seen)
+    return ssim_sum / seen, (lpips_sum / seen if LPIPS_LOSS else None)
 
 
 @torch.no_grad()
@@ -575,58 +885,103 @@ def save_preview(model, gm, test_views, test_orig, device, path, max_show=8):
     fig.tight_layout(); fig.savefig(path, dpi=120, bbox_inches="tight"); plt.close(fig)
 
 
+def train_forward(tmodel, gm, v_u8, gt_u8, dev):
+    """norm views + originals, autocast forward through (maybe compiled) tmodel, recon_loss.
+    Returns the shard's mean loss on `dev`. Shared by the primary and the dual-GPU replica."""
+    views = gm.norm_views(v_u8)
+    gt = gm.norm(gt_u8)
+    with torch.autocast("cuda", enabled=AMP and dev.type == "cuda"):
+        pred = call_model(tmodel, views, COMPILE)
+        return recon_loss(pred, gt)
+
+
 def main():
     torch.manual_seed(SEED)
     torch.backends.cudnn.benchmark = True
     device = get_device()
+    dev0 = torch.device("cuda:0") if device.type == "cuda" else device
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    train_views, train_orig, test_views, test_orig = build_view_cache(device)
+    train_views, train_orig, test_views, test_orig = build_view_cache(dev0)
     n_train = train_views.shape[0]
     print(f"train originals: {n_train} | test originals: {test_views.shape[0]} | "
           f"{NUM_PERTURB} views each, grid {GRID}x{GRID}")
 
-    gm = GridMaker().to(device)
-    model = build_model(MODEL).to(device).to(memory_format=torch.channels_last)
+    gm = GridMaker().to(dev0)
+    model = build_model(MODEL).to(dev0).to(memory_format=torch.channels_last)
     opt = make_optimizer(model, lr=LR, weight_decay=WEIGHT_DECAY)
     warmup = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=WARMUP_EPOCHS)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, EPOCHS - WARMUP_EPOCHS))
     sched = torch.optim.lr_scheduler.SequentialLR(opt, [warmup, cosine], milestones=[WARMUP_EPOCHS])
-    scaler = torch.amp.GradScaler("cuda", enabled=AMP and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=AMP and dev0.type == "cuda")
+
+    # --- dual-GPU replica: a second copy of the model on cuda:1 that runs the small shard.
+    # It has NO optimizer -- the single opt on cuda:0 owns the update, and after each step
+    # the fresh weights are copied back here (see the loop). Only `model` is checkpointed.
+    dual = DUAL_GPU and dev0.type == "cuda" and torch.cuda.device_count() >= 2
+    if dual:
+        dev1 = torch.device("cuda:1")
+        gm1 = GridMaker().to(dev1)
+        model1 = build_model(MODEL).to(dev1).to(memory_format=torch.channels_last)
+        with torch.no_grad():                              # replica starts bit-identical to primary
+            for p1, p0 in zip(model1.parameters(), model.parameters()):
+                p1.copy_(p0.to(dev1))
+            for b1, b0 in zip(model1.buffers(), model.buffers()):
+                b1.copy_(b0.to(dev1))
+        n1 = min(max(1, round(GPU1_FRAC * BATCH_SIZE)), BATCH_SIZE - 1)   # weak-GPU shard size
+        n0 = BATCH_SIZE - n1
+    else:
+        dev1, gm1, model1, n1, n0 = None, None, None, 0, BATCH_SIZE
+
+    train_model = torch.compile(model) if COMPILE else model
+    train_model1 = torch.compile(model1) if (COMPILE and dual) else model1
+
     print(f"model: {MODEL} | params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M | "
-          f"device: {device} | amp: {AMP} | batch: {BATCH_SIZE}")
+          f"device: {dev0} | amp: {AMP} | batch: {BATCH_SIZE} | compile: {COMPILE} | prefetch: {PREFETCH}")
+    if dual:
+        print(f"DUAL_GPU on -> split {n0} originals on {dev0} + {n1} on {dev1} "
+              f"(GPU1_FRAC={GPU1_FRAC}); size-weighted grad combine, single optimizer on {dev0}")
     if LEAK_VIEWS:
         print(f"LEAK_VIEWS on -> training on real-fragment input space "
               f"(noise={LEAK_NOISE}, contam_p={LEAK_CONTAM_P}) -> {CKPT_NAME}")
 
-    random.seed(SEED)            # reproducible per-step view-count sampling below
-    best = -1.0
+    random.seed(SEED)            # reproducible per-step view-count sampling (make_epoch_plan)
+    best = float("-inf")         # works for both "higher SSIM" and "lower LPIPS" (stored negated)
     for epoch in range(1, EPOCHS + 1):
         model.train()
+        if dual:
+            model1.train()
         t0, running, seen = time.time(), 0.0, 0
-        for sel in iter_batches(n_train, BATCH_SIZE, shuffle=True):
-            vb = fetch_views(train_views, sel, device)
-            # Per-step random view count (log-uniform in [VIEWS_MIN, VIEWS_MAX]),
-            # resampled every step so the model sees the full spread of token counts
-            # it faces on real clusters rather than one fixed count. One count per
-            # step (shared across the batch); the SetTransformer is count-invariant.
-            navail = vb.shape[1]
-            hi = min(VIEWS_MAX, navail)
-            lo = min(max(1, VIEWS_MIN), hi)
-            k = int(round(math.exp(random.uniform(math.log(lo), math.log(hi)))))
-            k = max(lo, min(k, hi))
-            if k < navail:
-                pick = torch.randperm(navail, device=vb.device)[:k]
-                vb = vb[:, pick]                           # random view subset, resampled each step
-            views = gm.norm_views(vb)
-            gt = gm.norm(train_orig[sel.to(device)])
+        plan = make_epoch_plan(n_train, BATCH_SIZE, n1)
+        loader = (CudaPrefetcher(train_views, train_orig, plan, dev0, dev1, n1) if PREFETCH else
+                  (prepare_batch(train_views, train_orig, sel, pick, dev0, dev1, n1) for sel, pick in plan))
+        for v0, gt0, v1, gt1 in loader:
             opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", enabled=AMP and device.type == "cuda"):
-                pred = model(views)
-                loss = recon_loss(pred, gt)
-            if not torch.isfinite(loss):
+            if dual:
+                model1.zero_grad(set_to_none=True)
+            loss0 = train_forward(train_model, gm, v0, gt0, dev0)
+            if not torch.isfinite(loss0):
                 continue                                   # skip a poisoned batch, keep weights
-            scaler.scale(loss).backward()
+            if dual:
+                loss1 = train_forward(train_model1, gm1, v1, gt1, dev1)
+                if not torch.isfinite(loss1):
+                    continue
+                s = scaler.get_scale()                     # same loss-scale S on both graphs
+                scaler.scale(loss0).backward()             # model.grad  = S * dloss0/dw  (mean over n0)
+                (loss1 * s).backward()                     # model1.grad = S * dloss1/dw  (mean over n1)
+                # Size-weighted combine == the exact gradient of one B-sized batch:
+                #   (n0*g0 + n1*g1)/B = S/B * (sum_{S0} grad l_i + sum_{S1} grad l_i)
+                with torch.no_grad():
+                    for p0_, p1_ in zip(model.parameters(), model1.parameters()):
+                        if p0_.grad is None and p1_.grad is None:
+                            continue
+                        g0 = p0_.grad if p0_.grad is not None else torch.zeros_like(p0_)
+                        g1 = p1_.grad.to(dev0) if p1_.grad is not None else 0.0
+                        p0_.grad = (n0 * g0 + n1 * g1) / BATCH_SIZE
+                step_loss = (n0 * loss0.detach().item() + n1 * loss1.detach().item()) / BATCH_SIZE
+            else:
+                scaler.scale(loss0).backward()
+                step_loss = loss0.detach().item()
             scaler.unscale_(opt)                           # unscale before clipping
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             if not torch.isfinite(gnorm):
@@ -635,21 +990,35 @@ def main():
                 continue                                   # never apply a non-finite-grad update
             scaler.step(opt)
             scaler.update()
-            running += float(loss) * len(sel)
-            seen += len(sel)
+            if dual:                                       # broadcast fresh weights to the replica
+                with torch.no_grad():
+                    for p0_, p1_ in zip(model.parameters(), model1.parameters()):
+                        p1_.copy_(p0_, non_blocking=True)
+            running += step_loss * BATCH_SIZE
+            seen += BATCH_SIZE
+        if PREFETCH:
+            loader.close()
         sched.step()
         train_loss = running / max(1, seen)
-        test_ssim = evaluate(model, gm, test_views, test_orig, device)
-        print(f"epoch {epoch:3d} | lr {sched.get_last_lr()[0]:.2e} | train 1-SSIM {train_loss:.4f} | "
-              f"test SSIM {test_ssim:.4f} | {time.time()-t0:.1f}s", flush=True)
+        test_ssim, test_lpips = evaluate(model, gm, test_views, test_orig, dev0)
+        loss_name = "LPIPS" if LPIPS_LOSS else "1-SSIM"
+        line = (f"epoch {epoch:3d} | lr {sched.get_last_lr()[0]:.2e} | "
+                f"train {loss_name} {train_loss:.4f} | test SSIM {test_ssim:.4f}")
+        if LPIPS_LOSS:
+            line += f" | test LPIPS {test_lpips:.4f}"
+        print(line + f" | {time.time()-t0:.1f}s", flush=True)
 
-        save_preview(model, gm, test_views, test_orig, device,
+        save_preview(model, gm, test_views, test_orig, dev0,
                      os.path.join(OUT_DIR, f"preview_epoch{epoch:03d}.png"))
-        if test_ssim > best:
-            best = test_ssim
+        # Select the checkpoint on the trained objective: lowest LPIPS (stored as its
+        # negative so "> best" still means "better") in LPIPS mode, else highest SSIM.
+        score = -test_lpips if LPIPS_LOSS else test_ssim
+        if score > best:
+            best = score
             torch.save(model.state_dict(), os.path.join(OUT_DIR, CKPT_NAME))
 
-    print(f"done. best test SSIM {best:.4f} | checkpoints + previews in {OUT_DIR}/")
+    best_str = f"LPIPS {-best:.4f}" if LPIPS_LOSS else f"SSIM {best:.4f}"
+    print(f"done. best test {best_str} | checkpoints + previews in {OUT_DIR}/")
 
 
 if __name__ == "__main__":

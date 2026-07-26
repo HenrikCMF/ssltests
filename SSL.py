@@ -1,15 +1,67 @@
 import io
 import gc
+import threading
+import concurrent.futures
 import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ---- Background model-save infrastructure (client-side I/O overlap) ---------- #
+# torch.save of a client's ~2.25 GB state (the LOKI trap fc1 dominates) blocks the
+# GPU between clients. With a persistent shared model the weights must be snapshotted
+# to CPU synchronously — before the next client overwrites them via set_parameters —
+# but the serialize + disk-write can then run on a background thread while the next
+# client loads and trains, overlapping this client's save with the next one's I/O
+# and compute. One worker: the writes are disk-bound, so a single writer avoids
+# saturating the disk with parallel multi-GB writes and keeps ordering trivial. All
+# state is per Ray-actor process; the executor is created lazily per process.
+_SAVE_EXECUTOR = None
+_SAVE_FUTURES = {}                       # path_prefix -> in-flight save Future
+_SAVE_LOCK = threading.Lock()
+
+
+def _save_executor():
+    global _SAVE_EXECUTOR
+    if _SAVE_EXECUTOR is None:
+        _SAVE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="model-saver")
+    return _SAVE_EXECUTOR
+
+
+def _await_pending_save(path_prefix: str) -> None:
+    """Block until any in-flight background save of this prefix has finished, so a
+    reader (load) never sees a half-written file and a re-save never races the old
+    one. A full round separates a client's save from its next load, so this is
+    almost always already complete and returns at once. Re-raises write errors."""
+    with _SAVE_LOCK:
+        fut = _SAVE_FUTURES.get(path_prefix)
+    if fut is not None:
+        fut.result()
+
+
+def _cpu_clone_sd(obj):
+    """Deep-copy a state_dict-like structure, moving every tensor to CPU. Snapshots
+    GPU state synchronously so the background writer only ever touches CPU memory
+    (the live GPU tensors are overwritten/freed by the next client)."""
+    if torch.is_tensor(obj):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _cpu_clone_sd(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_cpu_clone_sd(v) for v in obj)
+    return obj
+
+
+def _write_snapshot(path_prefix: str, snapshot: dict) -> None:
+    for suffix, sd in snapshot.items():
+        torch.save(sd, f"{path_prefix}{suffix}")
+
 # Throughput flags — set at import so every Ray worker process picks them up.
 #torch.set_float32_matmul_precision("high")
 #torch.backends.cuda.matmul.allow_tf32 = True
 #torch.backends.cudnn.allow_tf32 = True
-#torch.backends.cudnn.benchmark = False
+#torch.backends.cudnn.benchmark = True
 
 
 class SimpleBYOL:
@@ -49,6 +101,8 @@ class SimpleBYOL:
         local_epochs: int = 1,
         dataset_len: int = 0,
         total_rounds: int = 100,
+        persist_models: bool = False,
+        use_async_save: bool = False,
     ):
         if torch.cuda.is_available():
             device = "cuda"
@@ -60,7 +114,9 @@ class SimpleBYOL:
         self.online_device = device
         self.target_device = device
     
-        self.use_amp = True
+        # autocast below is hardcoded device_type="cuda"; only enable it on CUDA so
+        # the bf16 fast path no-ops (rather than misfires) on MPS/CPU.
+        self.use_amp = (device == "cuda")
 
         self.online_encoder = online_encoder.to(self.online_device)
         self.target_encoder = target_encoder.to(self.target_device)
@@ -86,6 +142,15 @@ class SimpleBYOL:
         self.lr            = lr
         self.m             = moving_average_decay
         self.use_ema       = use_ema
+        # When True the online/target/predictor modules are owned by a per-process
+        # cache in client.py and reused (with their torch.compile graph intact)
+        # every round, so release_gpu must NOT drop them — see release_gpu.
+        self.persist_models = bool(persist_models)
+        # When True, save() snapshots state to CPU synchronously and writes it to
+        # disk on a background thread so the ~2.25 GB serialize+write overlaps the
+        # next client's load+train instead of stalling the GPU. See save()/load()
+        # and the module-level _SAVE_* helpers.
+        self.use_async_save = bool(use_async_save)
 
         for p in self.target_encoder.parameters():
             p.requires_grad = False
@@ -173,18 +238,61 @@ class SimpleBYOL:
 
         return float(div)
 
+    def divergence_from_global(self, parameters: list) -> float:
+        """Paper Eq. 3 divergence ||W_g - W_k||: a single l2-norm over the WHOLE
+        online encoder (sqrt of the summed squared differences across every
+        encoder parameter), between the incoming global encoder and the current
+        local one. Computed without mutating any model so mu can be chosen before
+        blending. This matches the server's l2_norm_between and the paper, rather
+        than the mean-of-per-conv-layer distance used elsewhere — the per-layer
+        mean over-weights small, volatile shallow layers and trends opposite to
+        the true norm."""
+        keys = self._sd_float_keys(self.online_encoder)   # order matches parameters[:n_enc]
+        sd   = self.online_encoder.state_dict()
+        with torch.no_grad():
+            sq = 0.0
+            # zip stops after the encoder floats, ignoring the trailing predictor
+            # arrays in `parameters` — divergence is over the encoder only.
+            for k, arr in zip(keys, parameters):
+                local = sd[k].detach()
+                g = torch.from_numpy(arr).view_as(local).to(local.device, dtype=local.dtype)
+                diff = (local - g).double()
+                sq += float(diff.mul(diff).sum().item())
+            return math.sqrt(sq)
+
     # ------------------------------------------------------------------ #
     # Persistence
     # ------------------------------------------------------------------ #
 
     def save(self, path_prefix: str) -> None:
-        torch.save(self.online_encoder.state_dict(), f"{path_prefix}_model.pt")
-        torch.save(self.target_encoder.state_dict(), f"{path_prefix}_ema.pt")
-        torch.save(self.predictor.state_dict(),      f"{path_prefix}_pred.pt")
-        torch.save(self.optimizer.state_dict(),      f"{path_prefix}_optim.pt")
+        if not self.use_async_save:
+            torch.save(self.online_encoder.state_dict(), f"{path_prefix}_model.pt")
+            torch.save(self.target_encoder.state_dict(), f"{path_prefix}_ema.pt")
+            torch.save(self.predictor.state_dict(),      f"{path_prefix}_pred.pt")
+            torch.save(self.optimizer.state_dict(),      f"{path_prefix}_optim.pt")
+            return
+        # Snapshot GPU -> CPU synchronously (must finish before the next client
+        # overwrites the shared persistent model), then serialize+write in the
+        # background so the disk I/O overlaps the next client's load+train.
+        snapshot = {
+            "_model.pt": _cpu_clone_sd(self.online_encoder.state_dict()),
+            "_ema.pt":   _cpu_clone_sd(self.target_encoder.state_dict()),
+            "_pred.pt":  _cpu_clone_sd(self.predictor.state_dict()),
+            "_optim.pt": _cpu_clone_sd(self.optimizer.state_dict()),
+        }
+        # Finish (and surface errors from) any prior in-flight save of this prefix
+        # before overwriting its files, then hand this one to the background writer.
+        _await_pending_save(path_prefix)
+        with _SAVE_LOCK:
+            _SAVE_FUTURES[path_prefix] = _save_executor().submit(
+                _write_snapshot, path_prefix, snapshot)
 
     def load(self, path_prefix: str) -> bool:
         """Load all state from disk. Returns True on success, False if any file is missing."""
+        # A background save of this prefix from a previous round may still be in
+        # flight; block until it lands so we read complete files. No-op when async
+        # saving is off or the write already finished.
+        _await_pending_save(path_prefix)
         try:
             on, tg = self.online_device, self.target_device
             self.online_encoder.load_state_dict(torch.load(f"{path_prefix}_model.pt",   map_location=on))
@@ -276,7 +384,26 @@ class SimpleBYOL:
         disposable once the round's result tuple is built. Releasing them here
         stops the next client's ~5 GB of models from being allocated on top of this
         trainer's still-resident copy — the footprint stacking that pushes the
-        actor's high-water mark to ~2x and OOMs a later round."""
+        actor's high-water mark to ~2x and OOMs a later round.
+
+        With persist_models the models are instead owned by client.py's per-process
+        cache and reused every round so their torch.compile graph survives (no
+        recompile). Freeing them would defeat that AND force a recompile next round,
+        so we keep them resident and free only the per-round transients: the grads
+        and the optimizer's momentum buffers. Because every client loads its weights
+        into these SAME resident tensors (set_parameters copies in place), there is
+        exactly one model set per actor — so the stacking this method guarded against
+        cannot happen in the first place."""
+        if self.persist_models:
+            for m in (self.online_encoder, self.target_encoder, self.predictor):
+                if m is not None:
+                    for p in m.parameters():
+                        p.grad = None
+            self.optimizer = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return
         self.online_encoder = None
         self.target_encoder = None
         self.predictor      = None
@@ -297,11 +424,22 @@ class SimpleBYOL:
 
     @torch.no_grad()
     def _update_target(self) -> None:
+        # EMA every online param into its target counterpart, fused across the
+        # backbone's many small tensors into two foreach kernels — was a Python
+        # loop launching ~2 kernels per parameter every step. torch._foreach_*
+        # groups by (device, dtype) internally, so the mixed-precision target
+        # (fp32 backbone + bf16 trap fc1/fc2, see __init__) and any cross-device
+        # model-parallel split are handled with no special-casing of any param:
+        # verified bit-identical to the old mul_/add_ path, including the bf16 add.
         # p_on (online_device) -> p_tgt (target_device): the .to() is a no-op when
         # single-device, and a cross-GPU copy under model parallelism.
-        for p_on, p_tgt in zip(self.online_encoder.parameters(), self.target_encoder.parameters()):
-            src = p_on.data.to(p_tgt.device, non_blocking=True) if p_on.device != p_tgt.device else p_on.data
-            p_tgt.data.mul_(self.m).add_(src, alpha=1 - self.m)
+        tgt = [p.data for p in self.target_encoder.parameters()]
+        src = [
+            p_on.data.to(p_tgt.device, non_blocking=True) if p_on.device != p_tgt.device else p_on.data
+            for p_on, p_tgt in zip(self.online_encoder.parameters(), self.target_encoder.parameters())
+        ]
+        torch._foreach_mul_(tgt, self.m)
+        torch._foreach_add_(tgt, src, alpha=1 - self.m)
 
     @staticmethod
     def _sd_float_keys(module: nn.Module) -> list:

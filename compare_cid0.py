@@ -2,15 +2,20 @@
 compare_cid0.py -- validate the cluster reconstructions against the REAL data that
 the LOKI target (client 0) actually held.
 
+Works for either federated dataset via the DATASET switch below -- it just has to
+match the FedEMA_run.py run that produced the fragments (CIFAR-10 or Tiny ImageNet).
+
 We never used client 0's images anywhere in the pipeline, so they are an honest
 ground truth. Client 0's partition is fully determined by the run config
-(NUM_CLIENTS=5, classes_per_client=2, seed=12345 -> 2 full CIFAR-10 classes,
-10k images). For every reconstruction in reconstruction_out/cluster_recons we:
+(DATASET, NUM_CLIENTS, CLS_PER, DATA_FRACTION, SEED); we reconstruct it below. For
+the active TinyImageNet run (5 clients, 40 classes each, 0.5 data fraction) that is
+40 full classes = 10k images over a 50k participating pool. For every reconstruction
+in reconstruction_out/cluster_recons we:
 
-  * find its nearest CIFAR-10 train image over the FULL 50k set (mean-subtracted
+  * find its nearest train image over the FULL participating pool (mean-subtracted
     normalized cross-correlation on lightly-blurred RGB -- robust to the recon's
     colour drift / blur), and check whether that match falls inside client 0's set.
-    Chance is 10k/50k = 20%; a faithful leak lands far above it.
+    Chance is |client 0| / |pool| (= 10k/50k = 20% here); a faithful leak lands far above.
   * compare best-match scores against client 0 vs a non-target client (client 1,
     different classes) -- the null. Real leaks score much higher against client 0.
   * dump upscaled [recon | best client-0 match] montages for eyeballing.
@@ -28,11 +33,21 @@ from torchvision.utils import make_grid, save_image
 
 import reconstruction_test as R
 
-RECON_DIR   = "reconstruction_out/cluster_recons"
-CLUSTER_DIR = "fragments_clustered"        # bins that produced the reconstructions
+RECON_DIR   = os.environ.get("RECON_DIR", "reconstruction_out/cluster_recons")
+CLUSTER_DIR = os.environ.get("CLUSTER_DIR", "fragments_clustered")   # bins that produced the reconstructions
 DATA_DIR    = R.DATA_DIR
+# --- dataset selector (MUST match the federated run in FedEMA_run.py) -------- #
+# "cifar10"       -> 32x32, 10 classes, torchvision CIFAR10 (.data array)
+# "cifar100"      -> 32x32, 100 classes, torchvision CIFAR100 (.data array)
+# "tiny_imagenet" -> 64x64, 200 classes, ImageFolder under data/tiny-imagenet-200
+# Client 0's exact partition is fully determined by (DATASET, NUM_CLIENTS, CLS_PER,
+# DATA_FRACTION, SEED) -- keep these identical to FedEMA_run.py so the ground truth
+# we recover is bit-for-bit the images that client actually trained on.
+DATASET     = "cifar10"
 NUM_CLIENTS = 5
-CLS_PER     = 2
+# classes_per_client (FedEMA_run.py CLASSES_PER_CLIENT) -- per-dataset default.
+CLS_PER     = {"tiny_imagenet": 40, "cifar100": 20}.get(DATASET, 2)
+DATA_FRACTION = 1     # per-class fraction kept (FedEMA_run.py DATASET_FRACTION); 1.0 = full
 SEED        = 12345
 TARGET_CID  = 0
 NULL_CID    = 1
@@ -42,13 +57,73 @@ LP_GATE     = 0.23    # LPIPS gate for the boundary montage (lower = more simila
 # precision-weighted leak estimate: no single LPIPS gate works (genuine leaks exist
 # at every LPIPS level, just sparser), so bin each image's best LPIPS and weight by
 # the eyeballed genuine fraction g per bin (read off the match_lpbin_* montages).
-LP_BINS     = (0.0, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 1.0)
-LP_GENUINE  = (1.00, 0.90, 0.85, 0.55, 0.30, 0.12, 0.03)   # g per bin -- eyeballed from match_lpbin_*
+# IMPORTANT: g is DATASET/RESOLUTION-SPECIFIC and MUST be re-eyeballed per run. The
+# blurry 64px TinyImageNet recons sit at much higher LPIPS than the sharp 32px CIFAR
+# recons these were first tuned on, so genuine leaks pile into the high-LPIPS bins --
+# using CIFAR's g there (0.40-1.0 -> 0.03) throws away ~90% of real leaks. Values below
+# are eyeballed from the TinyImageNet match_lpbin_* montages; adjust to taste.
+LP_BINS     = (0.0, 0.20, 0.30, 0.40, 0.50, 0.60, 0.72, 1.0)
+LP_GENUINE  = (0.95, 0.90, 0.85, 0.70, 0.45, 0.25, 0.05)   # g per bin -- eyeballed from match_lpbin_*
+
+
+def stratified_keep_indices(targets, fraction, seed):
+    """Mirror of dataloader._stratified_keep_indices: sorted indices keeping `fraction`
+    of samples per class (every class stays represented), deterministic in `seed`. The
+    federated loader applies this BEFORE partitioning when DATASET_FRACTION < 1, so we
+    must replicate it or our recovered client partition drifts out of alignment."""
+    if fraction >= 1.0:
+        return list(range(len(targets)))
+    by_class: dict = {}
+    for i, c in enumerate(targets):
+        by_class.setdefault(int(c), []).append(i)
+    rng = np.random.default_rng(seed)
+    keep = []
+    for cls in sorted(by_class):
+        idx = np.asarray(by_class[cls])
+        n_keep = max(1, int(round(len(idx) * fraction)))
+        sel = rng.permutation(len(idx))[:n_keep]
+        keep.extend(idx[sel].tolist())
+    keep.sort()
+    return keep
+
+
+def load_dataset():
+    """Load the configured DATASET's TRAIN split as ([N,3,H,W] float in [0,1] on CPU,
+    targets int array), already reduced to the DATA_FRACTION per-class subset so row
+    order matches client_indices(). This is the pool of images that actually took part
+    in the federation -- the honest search space for the leak."""
+    if DATASET in ("cifar10", "cifar100"):
+        cls = torchvision.datasets.CIFAR100 if DATASET == "cifar100" else torchvision.datasets.CIFAR10
+        base = cls(root=DATA_DIR, train=True, download=True)
+        raw = np.asarray(base.data)                          # [50000,32,32,3] uint8
+        keep = stratified_keep_indices(base.targets, DATA_FRACTION, SEED)
+        raw = raw[keep]
+        targets = np.asarray(base.targets)[keep]
+        data = torch.from_numpy(raw).permute(0, 3, 1, 2).contiguous().float() / 255.0
+        return data, targets
+    if DATASET == "tiny_imagenet":
+        root = os.path.join(DATA_DIR, "tiny-imagenet-200")
+        ds = torchvision.datasets.ImageFolder(os.path.join(root, "train"))
+        keep = stratified_keep_indices([s[1] for s in ds.samples], DATA_FRACTION, SEED)
+        samples = [ds.samples[i] for i in keep]             # (path, class) pairs
+        targets = np.asarray([c for _, c in samples])
+        data = torch.empty(len(samples), 3, 64, 64, dtype=torch.float32)
+        for i, (path, _) in enumerate(samples):
+            with Image.open(path) as im:
+                arr = np.array(im.convert("RGB"), dtype=np.uint8)   # [64,64,3] (writable copy)
+            data[i] = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
+            if (i + 1) % 10000 == 0:
+                print(f"  loaded {i + 1}/{len(samples)} TinyImageNet images")
+        return data, targets
+    raise ValueError(f"unknown DATASET {DATASET!r}")
 
 
 def client_indices(targets, cid):
-    """Replicates dataloader.CIFAR10BYOLClientData._partition_indices (the active
-    shard method) to recover the exact train indices held by `cid`."""
+    """Recover the exact train indices held by `cid`, replicating the shard method in
+    dataloader.{CIFAR10,TinyImageNet}BYOLClientData._partition_indices (identical logic
+    for both). `targets` must already be the DATA_FRACTION subset from load_dataset, so
+    the returned indices line up with the data tensor's row order. num_classes is read
+    off `targets`, so this adapts to CIFAR (10) and TinyImageNet (200) automatically."""
     labels = np.asarray(targets)
     num_classes = len(np.unique(labels))
     shards_per_class = int(np.ceil(NUM_CLIENTS * CLS_PER / num_classes))
@@ -65,17 +140,22 @@ def client_indices(targets, cid):
     return np.array([i for s in shards for i in s])
 
 
-def ncc_feats(imgs, device, blur=2):
-    """imgs [N,3,32,32] in [0,1] -> mean-subtracted, L2-normalized, blurred feature
-    rows for cross-correlation matching (robust to brightness/contrast and blur)."""
-    x = Fn.avg_pool2d(imgs.to(device), blur)            # light blur: 32->16
-    x = x.flatten(1)
-    x = x - x.mean(1, keepdim=True)
-    return Fn.normalize(x, dim=1)
+def ncc_feats(imgs, device, blur=2, chunk=8192):
+    """imgs [N,3,H,W] in [0,1] -> mean-subtracted, L2-normalized, blurred feature rows
+    for cross-correlation matching (robust to brightness/contrast and blur). Chunked
+    over the host->device copy so the full (large, 64px) TinyImageNet pool never lands
+    on the GPU all at once. blur halves each spatial dim (32->16, 64->32)."""
+    out = []
+    for s in range(0, imgs.shape[0], chunk):
+        x = Fn.avg_pool2d(imgs[s:s + chunk].to(device), blur)    # light blur
+        x = x.flatten(1)
+        x = x - x.mean(1, keepdim=True)
+        out.append(Fn.normalize(x, dim=1))
+    return torch.cat(out)
 
 
 def ssim_pairs(a, b, device, ws=11, sigma=1.5, chunk=4096):
-    """Per-pair windowed SSIM for a,b [N,3,32,32] in [0,1] -> [N]."""
+    """Per-pair windowed SSIM for a,b [N,3,H,W] in [0,1] -> [N]."""
     c = torch.arange(ws, device=device).float() - (ws - 1) / 2
     g = torch.exp(-(c ** 2) / (2 * sigma ** 2)); g = g / g.sum()
     w = (g[:, None] @ g[None, :]).expand(3, 1, ws, ws).contiguous()
@@ -126,7 +206,7 @@ def topk_ncc(rf, gt_f, k, chunk=2048):
     return out
 
 
-def lpips_match(recons, gt_imgs, cand_idx, model, device, sz=64, chunk=256):
+def lpips_match(recons, gt_imgs, cand_idx, model, device, sz=64, chunk=64):
     """Re-rank each recon's candidate gt images by LPIPS (perceptual distance) and
     return (best_dist [N], best_gt_index [N]): the perceptually closest of the
     candidates. SSIM is harsh on the recons' blur/colour drift, so LPIPS recovers
@@ -149,31 +229,42 @@ def lpips_match(recons, gt_imgs, cand_idx, model, device, sz=64, chunk=256):
 
 def main():
     device = R.get_device()
-    base = torchvision.datasets.CIFAR10(root=DATA_DIR, train=True, download=True)
-    data = torch.from_numpy(base.data).permute(0, 3, 1, 2).float() / 255.0   # [50000,3,32,32]
-    targets = np.asarray(base.targets)
+    print(f"dataset: {DATASET}  (num_clients={NUM_CLIENTS}, classes/client={CLS_PER}, "
+          f"data_fraction={DATA_FRACTION})")
+    data, targets = load_dataset()
     idx0 = client_indices(targets, TARGET_CID)
     idx1 = client_indices(targets, NULL_CID)
     cls0 = sorted(set(targets[idx0].tolist()))
-    print(f"client {TARGET_CID}: {len(idx0)} imgs, classes {cls0} | "
-          f"null client {NULL_CID}: classes {sorted(set(targets[idx1].tolist()))}")
+    print(f"pool: {len(data)} imgs | client {TARGET_CID}: {len(idx0)} imgs across "
+          f"{len(cls0)} classes | null client {NULL_CID}: "
+          f"{len(set(targets[idx1].tolist()))} classes")
 
     files = sorted(glob.glob(os.path.join(RECON_DIR, "*.png")))
     recons = torch.stack([torch.from_numpy(np.asarray(Image.open(f), dtype=np.uint8))
                           .permute(2, 0, 1).float() / 255.0 for f in files])
     print(f"{len(recons)} reconstructions from {RECON_DIR}")
 
+    # ground truth must live at the reconstruction resolution (the inverter's output
+    # size) so NCC/SSIM/LPIPS compare like-for-like. TinyImageNet is natively 64px ==
+    # recon size (no-op here); an upscaled CIFAR inverter (R.UPSCALE) emits recons
+    # larger than the 32px originals, so bring GT up to match.
+    img_sz = recons.shape[-1]
+    if data.shape[-1] != img_sz:
+        print(f"resizing GT {data.shape[-1]}px -> {img_sz}px to match reconstructions")
+        data = Fn.interpolate(data, size=img_sz, mode="bicubic", align_corners=False).clamp_(0, 1)
+
     rf = ncc_feats(recons, device)
     full_f = ncc_feats(data, device)
     gt0_f = full_f[torch.from_numpy(idx0).to(device)]
     gt1_f = full_f[torch.from_numpy(idx1).to(device)]
 
-    # 1) full-set match: does the nearest of ALL 50k land in client 0's set?
+    # 1) full-set match: does the nearest over the whole participating pool land in
+    # client 0's set?
     sc_full, idx_full = best_match(rf, full_f)
 
-    # enforce one match per image: if several recons share the same nearest
-    # CIFAR-10 image, keep only the best-scoring one so a single leaked picture
-    # isn't double-counted (e.g. several clusters reconstructing the same image).
+    # enforce one match per image: if several recons share the same nearest pool
+    # image, keep only the best-scoring one so a single leaked picture isn't
+    # double-counted (e.g. several clusters reconstructing the same image).
     keep = unique_best_mask(sc_full, idx_full); kc = keep.cpu()
     n_before, n_keep = len(recons), int(keep.sum())
     files  = [f for f, k in zip(files, kc.tolist()) if k]
@@ -213,7 +304,7 @@ def main():
     # distinct client-0 images actually reconstructed: an image counts as leaked
     # only if >=1 recon clears the SSIM bar against it. This is the defensible
     # leak count -- it gates on fidelity, not just nearest-neighbour proximity.
-    gleak = torch.from_numpy(idx0).to(device)[idx0_match]   # global CIFAR idx of each recon's client-0 match
+    gleak = torch.from_numpy(idx0).to(device)[idx0_match]   # global pool idx of each recon's client-0 match
     d5 = int(torch.unique(gleak[ss0 > 0.5]).numel())
     d7 = int(torch.unique(gleak[ss0 > 0.7]).numel())
     print(f"  distinct client-0 leaked @SSIM>0.5: {d5}/{len(idx0)} ({d5/len(idx0)*100:.1f}%)   "
@@ -223,14 +314,14 @@ def main():
     # re-rank each recon's top-K NCC client-0 candidates by LPIPS (perceptual) and
     # gate on that. lp_j is a position in client-0's set; lp is the distance (lower
     # = more similar). Lets us catch faithful leaks that sit below the SSIM bar.
-    lp_model = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    lp_model = lpips.LPIPS(net="vgg", verbose=False).to(device).eval()
     for p in lp_model.parameters():
         p.requires_grad_(False)
     cand = topk_ncc(rf, gt0_f, LPIPS_K)
     lp, lp_j = lpips_match(recons, gt0_imgs, cand, lp_model, device)
     print(f"\nLPIPS(recon, best client-0 match): median {float(lp.median()):.3f}  "
           f"p10 {float(lp.quantile(.1)):.3f}  p90 {float(lp.quantile(.9)):.3f}  (lower = better)")
-    gleak_lp = torch.from_numpy(idx0)[lp_j]   # global CIFAR idx of each recon's LPIPS match
+    gleak_lp = torch.from_numpy(idx0)[lp_j]   # global pool idx of each recon's LPIPS match
     print("  distinct client-0 leaked @LPIPS<t:")
     for t in (0.10, 0.15, 0.20, 0.25, 0.30):
         d = int(torch.unique(gleak_lp[lp < t]).numel())

@@ -12,9 +12,10 @@ Paper protocol:
   - Train a single new fully-connected layer on top of the frozen features for
     200 epochs, batch size 512, Adam, lr 3e-3.
   - Report top-1 accuracy on the test set. Number of classes is inferred from
-    the labels, so CIFAR-10 (10) and Tiny ImageNet (200) both work.
+    the labels, so CIFAR-10 (10), CIFAR-100 (100) and Tiny ImageNet (200) all work.
 
 Run:  python result_evaluation.py --dataset cifar10
+      python result_evaluation.py --dataset cifar100
       python result_evaluation.py --dataset tiny_imagenet
 """
 import argparse
@@ -24,14 +25,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from architectures import ResNet18Projv3
-from dataloader import CIFAR10BYOLClientData, TinyImageNetBYOLClientData
+from dataloader import CIFAR10BYOLClientData, CIFAR100BYOLClientData, TinyImageNetBYOLClientData
 
 EMBEDDING_SIZE = 2048          # must match training (FedEMA_run.py)
-CKPT = "eval_model.pth"
+CKPT = "eval_model_eps_1e+26.pth"
 
 # dataset -> (loader class, paper linear-eval baseline string or None)
 DATASETS = {
     "cifar10":       (CIFAR10BYOLClientData,       "Paper FedBYOL linear eval (CIFAR-10)    : 79.44%"),
+    "cifar100":      (CIFAR100BYOLClientData,      None),
     "tiny_imagenet": (TinyImageNetBYOLClientData,  None),
 }
 
@@ -124,7 +126,8 @@ def main():
     ap.add_argument("--data-dir", default="./data")
     args = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available()
+                          else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"device: {device} | checkpoint: {args.ckpt} | dataset: {args.dataset}")
 
     loader_cls, paper_baseline = DATASETS[args.dataset]
