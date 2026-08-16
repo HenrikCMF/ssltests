@@ -128,10 +128,9 @@ def noise_std_for_eps(eps: float, delta: float, rounds: int, clip: float) -> flo
 def eps_for_noise_std(sigma: float, delta: float, rounds: int, clip: float) -> float:
     """Inverse of `noise_std_for_eps`: the eps a given noise std actually buys.
 
-    Lets the pre-existing fixed-std runs (DP_SCHEME="global", DP_GLOBAL_STD)
-    be placed on the same eps axis retroactively — provided a clip norm is
-    named for them, since without one they have no bounded sensitivity and
-    hence no epsilon at all.
+    Places a run described by its absolute noise std on the eps axis — provided
+    a clip norm is named for it, since without one there is no bounded
+    sensitivity and hence no epsilon at all.
     """
     if sigma <= 0.0:
         return math.inf

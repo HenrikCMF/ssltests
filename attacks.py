@@ -507,8 +507,8 @@ class Loki:
 
         Same rows as `reconstruct`/`reconstruct_with_fired`, but only the amax is
         kept, so no multi-GB fragment tensor is built (matters on the memory-tight
-        server). Paired with the client's logged DP eff.abs.noise_std it fixes the
-        sandbox LEAK_NOISE (reconstruction_test.dp_noise_to_leak_noise)."""
+        server). Paired with the client's logged DP sigma it fixes the sandbox
+        LEAK_NOISE (reconstruction_test.dp_noise_to_leak_noise)."""
         g = weight_grad.detach().to(self.device)
         block = g[:, self._client_block(target_cid)]
         elems = self.set_size * self.H * self.W

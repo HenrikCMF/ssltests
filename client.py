@@ -1,6 +1,12 @@
+import os
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Suffix appended to every fixed output path so two runs can share the filesystem
+# (dp_eps_sweep.py runs one point per GPU concurrently). Empty => unchanged paths.
+RUN_TAG = os.getenv("RUN_TAG", "")
+LOCAL_WEIGHTS = f"local_weights{RUN_TAG}"
 import numpy as np
 import torch
 import flwr as fl
@@ -107,9 +113,6 @@ class FedClient(fl.client.NumPyClient):
                  data_fraction: float = 1.0,
                  strong_aug: bool = False,
                  dp: bool = False,
-                 dp_noise_multiplier: float = 0.0,
-                 dp_scheme: str = "per_layer",
-                 dp_global_std: float = 0.0,
                  dp_eps: float = 0.0,
                  dp_delta: float = 1e-5,
                  dp_clip: float = 0.0,
@@ -127,40 +130,16 @@ class FedClient(fl.client.NumPyClient):
         self.lambda_k     = None
         self.NUM_ROUND    = 0.0
         # Differential-privacy mode. When True, every client perturbs the model
-        # update it transmits (update = local - global) before sending it. The
-        # client is blind to any server-injected structure (e.g. a LOKI trap), so
-        # it applies ONE uniform rule to every parameter array: add Gaussian noise
-        # whose L2 norm equals dp_noise_multiplier x that array's own update norm
-        # (see _apply_dp). Scaling per layer is essential here — a single GLOBAL
-        # clip or noise is set by LOKI's ~1e5-scaled trap layer, which drives the
-        # real encoder/predictor update to zero; per-layer relative noise instead
-        # perturbs every layer by the same fraction, so the honest model keeps
-        # learning while the trap channel LOKI reads is degraded. dp_noise_multiplier
-        # is the adjustable "amount of noise" knob (0 disables it); with relative
-        # scaling it needs no clip-norm calibration. Mirrors the strong_aug defense
-        # toggle but acts on the transmitted weights, not the input views.
+        # update it transmits (update = local - global) before sending it (see
+        # _apply_dp): the WHOLE update vector is clipped to dp_clip, then Gaussian
+        # noise calibrated by dp_accounting for dp_eps over total_rounds is added.
+        # The guarantee is CLIENT-level and LOCAL — the client noises its own
+        # update, so it holds against the malicious server itself, which is the
+        # only granularity worth claiming when the aggregator is the adversary.
+        # Sweep dp_eps to trade extraction success against accuracy. Mirrors the
+        # strong_aug defense toggle but acts on the transmitted weights, not the
+        # input views.
         self.dp                  = bool(dp)
-        self.dp_noise_multiplier = float(dp_noise_multiplier)
-        # DP scheme selector (see _apply_dp):
-        #   "eps"       — the only scheme with a real (eps, delta) guarantee. Clips
-        #                 the WHOLE update vector to dp_clip, then adds the Gaussian
-        #                 noise that dp_accounting calibrates for dp_eps over
-        #                 total_rounds. Client-level DP in the local model (the
-        #                 server is the adversary, so it cannot be trusted to add
-        #                 the noise itself). Sweep dp_eps to trade extraction
-        #                 success against accuracy.
-        #   "per_layer" — LEGACY, NOT (eps, delta)-DP. noise L2 = dp_noise_multiplier
-        #                 * ||u_layer||, scaled to EACH layer's own update norm. Has
-        #                 no epsilon because (a) nothing is clipped, so sensitivity is
-        #                 unbounded, and (b) the noise scale is itself a function of
-        #                 the private data. Kept so earlier runs stay reproducible.
-        #   "global"    — LEGACY, NOT (eps, delta)-DP. One absolute std on every
-        #                 weight (N(0, dp_global_std^2)), no clip => unbounded
-        #                 sensitivity => no epsilon. Kept for the earlier fixed-std
-        #                 sweep; dp_accounting.eps_for_noise_std can place those runs
-        #                 on the eps axis after the fact IF a clip norm is named.
-        self.dp_scheme           = str(dp_scheme)
-        self.dp_global_std       = float(dp_global_std)
         self.dp_eps              = float(dp_eps)
         self.dp_delta            = float(dp_delta)
         self.dp_clip             = float(dp_clip)
@@ -172,13 +151,13 @@ class FedClient(fl.client.NumPyClient):
         # be based on. NEVER report a run made in this mode as private.
         self.dp_calibrate        = bool(dp_calibrate)
         # Calibrate eps -> noise std ONCE. This must not depend on the data (a
-        # data-dependent noise scale is exactly what voids the legacy schemes'
-        # claim), so it is fixed here from public hyperparameters only.
+        # data-dependent noise scale would void the guarantee), so it is fixed
+        # here from public hyperparameters only.
         self.dp_sigma = 0.0
-        if self.dp and self.dp_scheme == "eps" and not self.dp_calibrate:
+        if self.dp and not self.dp_calibrate:
             if self.dp_clip <= 0.0:
                 raise ValueError(
-                    'DP_SCHEME="eps" requires DP_CLIP > 0: with no clip the update '
+                    "DP_MODE requires DP_CLIP > 0: with no clip the update "
                     "has unbounded L2 sensitivity and no epsilon exists."
                 )
             self.dp_sigma = noise_std_for_eps(
@@ -206,8 +185,8 @@ class FedClient(fl.client.NumPyClient):
         self.loki_fc_size     = loki_fc_size
         self.loki_num_kernels = loki_num_kernels
 
-        self._weight_prefix = f"local_weights/client{self.cid}"
-        self._lambda_path   = f"local_weights/lambda{self.cid}.pkl"
+        self._weight_prefix = f"{LOCAL_WEIGHTS}/client{self.cid}"
+        self._lambda_path   = f"{LOCAL_WEIGHTS}/lambda{self.cid}.pkl"
 
         # Reuse the per-process data object across rounds (see _DATA_CACHE).
         cache_key = (self.cid, num_partitions, batch_size, dataset, data_fraction, strong_aug)
@@ -358,86 +337,12 @@ class FedClient(fl.client.NumPyClient):
     # ------------------------------------------------------------------ #
 
     def _apply_dp(self, global_params, local_params):
-        """Per-layer relative Gaussian perturbation of the transmitted update.
-
-        For each parameter array the update u = local - global is perturbed by
-        i.i.d. Gaussian noise whose L2 norm equals sigma * ||u|| (sigma =
-        self.dp_noise_multiplier), then re-centred on the global model. Because
-        the noise is scaled to each layer's own update norm, one sigma perturbs
-        every layer by the same fraction of its update — the huge CSF-scaled LOKI
-        trap and the small real weights alike — so the honest model keeps learning
-        while the trap-delta channel LOKI reads is degraded. A single global clip
-        or global noise cannot do this: LOKI's ~1e5-scaled trap dominates the norm
-        and any usable noise level then swamps the real update.
-
-        Note: this is an empirical relative-noise defense, not formally-accounted
-        (eps, delta)-DP — a real privacy budget is unattainable at 5 clients anyway.
-        Math runs in float64; each array is cast back to its float32 dtype.
-        """
-        if self.dp_scheme == "eps":
-            return self._apply_dp_eps(global_params, local_params)
-
-        sigma  = self.dp_noise_multiplier
-        glob   = (self.dp_scheme == "global")
-        g_std  = self.dp_global_std
-        out, norms, sizes = [], [], []
-        for l, g in zip(local_params, global_params):
-            u = l.astype(np.float64) - g.astype(np.float64)
-            n = float(np.sqrt(np.sum(u * u)))
-            norms.append(n)
-            sizes.append(u.size)
-            if glob:
-                # "global": ONE absolute per-coordinate std on every layer alike.
-                if g_std > 0.0:
-                    u = u + self._dp_rng.normal(0.0, g_std, size=u.shape)
-            elif sigma > 0.0 and n > 0.0:
-                # "per_layer": noise L2 norm == sigma * this layer's own norm.
-                std = sigma * n / np.sqrt(u.size)
-                u = u + self._dp_rng.normal(0.0, std, size=u.shape)
-            out.append((g.astype(np.float64) + u).astype(g.dtype))
-        if self.cid == 0 and norms:
-            # The dominant-norm array is the LOKI trap fc1 in practice; its
-            # effective ABSOLUTE per-coordinate noise std is what the LOKI paper's
-            # sigma axis (Fig. 12) measures, so log it to compare on equal footing.
-            j = int(np.argmax(norms))
-            if glob:
-                # global: every layer gets the SAME absolute std g_std.
-                print(f"r{int(self.NUM_ROUND)} dp(GLOBAL): abs.std={g_std:g} on ALL "
-                      f"layers  |update| min={min(norms):.4g} max={norms[j]:.4g}  "
-                      f"dominant-layer d={sizes[j]:g} "
-                      f"[one std for a ~7-decade layer spread -> see layer-RMS]")
-            else:
-                eff_std = sigma * norms[j] / np.sqrt(sizes[j]) if sizes[j] else 0.0
-                print(f"r{int(self.NUM_ROUND)} dp(per-layer): sigma={sigma:g}  "
-                      f"|update| min={min(norms):.4g} max={norms[j]:.4g}  "
-                      f"dominant-layer d={sizes[j]:g}  "
-                      f"eff.abs.noise_std(that layer)={eff_std:.4g} "
-                      f"[vs LOKI paper's absolute sigma]")
-            # Per-layer update RMS distribution -- the evidence for/against "just use
-            # low global DP". Global DP is one absolute noise s for all layers; it can
-            # both spare honest learning AND corrupt the leak only if the leak signal
-            # (~m_fired median ~1e-3) sits BELOW every honest layer's RMS (a clean gap).
-            # If honest layers reach down to/below ~1e-3, the scales overlap and no
-            # single s works. Count layers per decade to see the spread directly.
-            rms = np.array([n / np.sqrt(s) for n, s in zip(norms, sizes) if n > 0.0 and s > 0])
-            if rms.size:
-                pct = np.percentile(rms, [0, 10, 50, 90, 100])
-                below = {t: int((rms < t).sum()) for t in (1e-4, 1e-3, 1e-2)}
-                print(f"r{int(self.NUM_ROUND)} dp(layer-RMS n={rms.size}): "
-                      f"min={pct[0]:.3g} p10={pct[1]:.3g} median={pct[2]:.3g} "
-                      f"p90={pct[3]:.3g} max={pct[4]:.3g}  "
-                      f"#layers<1e-4={below[1e-4]} <1e-3={below[1e-3]} <1e-2={below[1e-2]} "
-                      f"[overlap w/ leak ~1e-3 => global DP can't gap it]")
-        return out
-
-    def _apply_dp_eps(self, global_params, local_params):
         """Client-level local DP with a real (eps, delta) guarantee.
 
         The mechanism, in order:
           1. u = local - global, over the FULL parameter vector (all arrays).
-          2. Clip: u <- u * min(1, C/||u||_2). This is the step the legacy
-             schemes lack, and it is what creates a bounded L2 sensitivity —
-             without it no epsilon exists at any noise level.
+          2. Clip: u <- u * min(1, C/||u||_2). This is what creates a bounded
+             L2 sensitivity — without it no epsilon exists at any noise level.
           3. Add N(0, sigma^2) to every coordinate, sigma calibrated from
              dp_eps in __init__ (see dp_accounting).
           4. Re-centre on the global model and send.
@@ -550,6 +455,21 @@ class FedClient(fl.client.NumPyClient):
         print(f"[DP-CAL] r{int(self.NUM_ROUND)} top arrays by |update|:")
         for i in order:
             print(f"[DP-CAL]     {norms[i]:>12.6g}  {str(updates[i].shape):>18}  {keys[i]}")
+
+        # Per-array update RMS distribution. Unlike the honest/trap split above this
+        # needs NO key names, so it is what a client could actually compute about its
+        # own update: the trap sits ~6 decades above every honest array in per-coord
+        # RMS. That makes the anomaly blind-DETECTABLE — which is anomaly detection,
+        # not DP, and does not rescue the clip (see DP_CLIP_CALIBRATION.md).
+        rms = np.array([n / np.sqrt(u.size) for n, u in zip(norms, updates)
+                        if n > 0.0 and u.size > 0])
+        if rms.size:
+            pct = np.percentile(rms, [0, 10, 50, 90, 100])
+            below = {t: int((rms < t).sum()) for t in (1e-4, 1e-3, 1e-2)}
+            print(f"[DP-CAL] r{int(self.NUM_ROUND)} layer-RMS (n={rms.size}): "
+                  f"min={pct[0]:.3g} p10={pct[1]:.3g} median={pct[2]:.3g} "
+                  f"p90={pct[3]:.3g} max={pct[4]:.3g}  "
+                  f"#layers<1e-4={below[1e-4]} <1e-3={below[1e-3]} <1e-2={below[1e-2]}")
 
     # ------------------------------------------------------------------ #
     # Persistence

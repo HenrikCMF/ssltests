@@ -22,6 +22,11 @@ import numpy as np
 from typing import List
 from attacks import Loki, LokiConfig
 
+# Suffix appended to every fixed output path so two runs can share the filesystem
+# (dp_eps_sweep.py runs one point per GPU concurrently). Empty => unchanged paths.
+RUN_TAG = os.getenv("RUN_TAG", "")
+EVAL_MODEL_PATH = f"eval_model{RUN_TAG}.pth"
+
 # Throughput flags for the server-side kNN eval (full forward over CIFAR each round).
 #torch.set_float32_matmul_precision("high")
 #torch.backends.cuda.matmul.allow_tf32 = True
@@ -240,7 +245,7 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
                  loki_config: Optional[LokiConfig] = None, loki_enabled: bool = False,
                  loki_target_cid: int = 0, loki_extract_all: bool = False,
                  loki_save_fragments: bool = True,
-                 loki_fragments_dir: str = "fragments",
+                 loki_fragments_dir: str = f"fragments{RUN_TAG}",
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -511,21 +516,19 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         self._armed_bias = None
         frags, counts = self.loki.reconstruct_with_bias_count(upd_w, upd_b, target_cid=0)
 
-        # LEAK_NOISE mapping inputs, both read from the FC1 WEIGHT update LOKI
-        # actually reconstructs from (upd_w) -- NOT the client's logged
-        # eff.abs.noise_std, which is for the dominant-NORM layer (the FC1 bias /
-        # conv, d=fc_size), a different layer LOKI never reads.
-        #   fc1w_rms = ||upd_w|| / sqrt(numel): RMS of the weight update. The DP
-        #     noise added to THIS layer had absolute std ~= sigma * fc1w_rms.
+        # LEAK_NOISE mapping input, read from the FC1 WEIGHT update LOKI actually
+        # reconstructs from (upd_w):
         #   m_fired  = max-abs of each fired bin's Eq.9 source row (the per-bin
         #     denominator reconstruct() divides by). The clean signal, not noise.
-        # After Eq.9 (divide row by its m_fired), bin i's fragment noise std is
-        # (sigma * fc1w_rms) / m_fired[i]. This is the SINGLE-target path (upd_w is
-        # one client's update), so no cross-client sqrt(K):
-        #   LEAK_NOISE ~= sigma * fc1w_rms / median(m_fired)   [num_clients=1]
+        # DP adds the same ABSOLUTE per-coordinate std sigma to every update
+        # coordinate, so after Eq.9 (divide row by its m_fired) bin i's fragment
+        # noise std is simply sigma / m_fired[i]. This is the SINGLE-target path
+        # (upd_w is one client's update), so no cross-client sqrt(K):
+        #   LEAK_NOISE ~= sigma / median(m_fired)   [num_clients=1]
         # (reconstruction_test.dp_noise_to_leak_noise; the sqrt(K) factor there is
         # only for the aggregate _loki_reconstruct_all path). NOTE m_fired spans
         # ~100x across bins, so one scalar LEAK_NOISE only matches the MEDIAN bin.
+        # fc1w_rms is logged alongside as a plain scale diagnostic for this layer.
         # bin_mass is frag-free to stay within the server's memory budget.
         _mass = self.loki.bin_mass(upd_w, target_cid=0)
         _mf = _mass[self.loki.fired_mask(_mass)]
@@ -534,7 +537,7 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
             print(f"r{int(server_round)} loki(cid0): fc1w_rms={_rms:.4g}  "
                   f"m_fired median={_mf.median():.4g} min={_mf.min():.4g} "
                   f"max={_mf.max():.4g} n_fired={_mf.numel()}  "
-                  f"[single-target: LEAK_NOISE ~= DP_NOISE*fc1w_rms/m_fired]")
+                  f"[single-target: LEAK_NOISE ~= dp_sigma/m_fired]")
         del _mass, _mf
 
         # Incremental bias learning (Sec. 4.1): refine the distribution using the
@@ -635,15 +638,15 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
                 fired_cutoffs.extend(cutoffs.to(fired.device)[fired].cpu().tolist())
                 if cid == 0:
                     # m_fired = median max-abs of a fired bin's Eq.9 source row (the
-                    # per-bin normalizer). Paired with the client's logged DP
-                    # eff.abs.noise_std, this pins the sandbox LEAK_NOISE equivalent:
-                    # LEAK_NOISE ~= sqrt(K) * eff_std / m_fired  (see reconstruction_test
-                    # .dp_noise_to_leak_noise). Logged because RMS(eff_std) << peak(m_fired)
+                    # per-bin normalizer). Paired with the client's logged DP sigma,
+                    # this pins the sandbox LEAK_NOISE equivalent:
+                    # LEAK_NOISE ~= sqrt(K) * sigma / m_fired  (see reconstruction_test
+                    # .dp_noise_to_leak_noise). Logged because sigma << peak(m_fired)
                     # is exactly the sparsity confound that makes equal values diverge.
                     fm = mass[fired]
                     print(f"r{int(server_round)} loki(cid0): m_fired median={fm.median():.4g} "
                           f"min={fm.min():.4g} max={fm.max():.4g}  n_fired={int(fired.sum())} "
-                          f"[Eq.9 denom; use with dp eff_std -> LEAK_NOISE]")
+                          f"[Eq.9 denom; use with dp sigma -> LEAK_NOISE]")
             if self.loki_save_fragments:
                 # Per-client subdir so reconstructed data stays tied to its owner
                 # (Sec. 4.2). counts=fired marks the kept (non-empty) bins.
@@ -755,12 +758,12 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         is_best = b_acc_knn > getattr(self, "_best_knn_acc", -1.0)
         if is_best:
             self._best_knn_acc = b_acc_knn
-            torch.save(self.eval_model.state_dict(), "eval_model.pth")
+            torch.save(self.eval_model.state_dict(), EVAL_MODEL_PATH)
 
         # Training-quality axis (pair with the LOKI m_fired leak axis) so a DP sweep
         # shows both effects in one log.
         print(f"r{int(server_round)} eval: knn_acc={b_acc_knn*100:.2f}%"
-              f"{'  [NEW BEST -> eval_model.pth]' if is_best else ''}  [training-quality axis]")
+              f"{f'  [NEW BEST -> {EVAL_MODEL_PATH}]' if is_best else ''}  [training-quality axis]")
 
         # The 50k feature bank + the 10k x 50k kNN similarity matmul are sizeable
         # GPU allocations that PyTorch's caching allocator otherwise keeps reserved

@@ -152,47 +152,41 @@ OUT_DIR       = "reconstruction_out"
 # UPDATE: that premise no longer holds once the federated run uses DP_MODE. DP injects
 # a genuinely Gaussian perturbation into the transmitted update (client._apply_dp), so
 # the real fragments now carry Gaussian corruption on TOP of the binning/few-view kind.
-# LEAK_NOISE below is re-enabled to ~match that DP noise. It is NOT equal to DP_NOISE:
-# DP_NOISE (sigma) is a RELATIVE fraction of a layer's update norm, whereas LEAK_NOISE is
-# an ABSOLUTE std in the Eq.9 max-abs-1 fragment space. The link (see dp_noise_to_leak_noise
-# below) goes through the FC1 WEIGHT update LOKI reads -- its RMS fc1w_rms and the Eq.9
-# per-bin normalizer m_fired:
-#   LEAK_NOISE ~= sqrt(K) * sigma * fc1w_rms / median(m_fired).
-# CAUTION: do NOT use the client's logged "eff.abs.noise_std" (~430) here -- that is the
-# dominant-NORM layer (FC1 bias/conv), a DIFFERENT layer LOKI never reconstructs from.
-# fc1w_rms and m_fired are both logged by a real DP round (server LOKI reconstruct line).
-# m_fired spans ~100x across bins, so one scalar LEAK_NOISE matches only the median bin;
-# SWEEP around the computed value and judge by real-fragment recon.
+# LEAK_NOISE below is re-enabled to ~match that DP noise. It is NOT equal to the DP
+# sigma: DP adds an ABSOLUTE per-coordinate std in WEIGHT space, whereas LEAK_NOISE is
+# an absolute std in the Eq.9 max-abs-1 FRAGMENT space. The link (see
+# dp_noise_to_leak_noise below) is the Eq.9 per-bin normalizer m_fired:
+#   LEAK_NOISE ~= sqrt(K) * sigma_dp / median(m_fired).
+# sigma_dp is logged by the client each DP round ("dp(eps): ... sigma=") and equals
+# dp_accounting.noise_std_for_eps(DP_EPS, DP_DELTA, NUM_ROUNDS, DP_CLIP); m_fired is
+# logged by the server LOKI reconstruct line. m_fired spans ~100x across bins, so one
+# scalar LEAK_NOISE matches only the median bin; SWEEP around the computed value and
+# judge by real-fragment recon.
 LEAK_VIEWS    = True         # train/eval on LOKI-leak-style views (match real fragments)
-LEAK_NOISE    = 0.14          # ~matches DP_NOISE=0.05; sweep {0.02,0.05,0.1} pre-to_unit
+LEAK_NOISE    = 0.14          # sweep {0.02,0.05,0.1} pre-to_unit
 LEAK_CONTAM_P = 0.0           # per-view prob. of blending a decoy view (bin contamination)
 LEAK_CONTAM_A = 0.5           # decoy blend weight when a view is contaminated
 
 
-def dp_noise_to_leak_noise(sigma, fc1w_rms, m_fired, num_clients=1):
-    """Convert a real DP run's FC1-weight noise into the equivalent sandbox LEAK_NOISE.
+def dp_noise_to_leak_noise(sigma, m_fired, num_clients=1):
+    """Convert a real DP run's weight-space noise into the equivalent sandbox LEAK_NOISE.
 
     Maps the weight-space DP perturbation (client._apply_dp) to the image-space
     LEAK_NOISE applied in leak_views, so both land the same noise-to-signal ratio
     on the pre-to_unit fragment that LOKI's Eq.9 produces.
 
-    IMPORTANT: this must use the FC1 *weight* layer LOKI reconstructs from, NOT the
-    client's logged "eff.abs.noise_std". That log is for the dominant-NORM layer
-    (the FC1 bias / conv, d=fc_size) -- a *different* layer LOKI never reads, whose
-    absolute noise (~430) is unrelated to the weight-gradient signal.
-
     Args:
-      sigma    : DP_NOISE, the per-layer relative noise fraction (e.g. 0.1).
-      fc1w_rms : RMS of the FC1 WEIGHT update = ||upd_w|| / sqrt(numel). The DP
-                 noise on this layer had absolute per-coord std ~= sigma * fc1w_rms.
-                 Printed by the server LOKI reconstruct line as "fc1w_rms".
+      sigma    : the DP mechanism's ABSOLUTE per-coordinate noise std, which is
+                 applied uniformly to every update coordinate — including the FC1
+                 weight row LOKI reconstructs from. Logged by the client as
+                 "dp(eps): ... sigma=".
       m_fired  : Eq.9 per-bin normalizer = max-abs of a fired bin's weight-update
                  row (use the MEDIAN over fired bins, "m_fired median" in the log).
                  reconstruct() divides each row by this, so the clean fragment has
-                 max-abs 1 and the noise std becomes (sigma*fc1w_rms)/m_fired there.
+                 max-abs 1 and the noise std becomes sigma/m_fired there.
       num_clients: K participating clients per round. Each adds independent noise
                  into every column LOKI reads while the de-aggregated signal is one
-                 client's, so summed noise std ~ sqrt(K) * (sigma*fc1w_rms).
+                 client's, so summed noise std ~ sqrt(K) * sigma.
 
     Returns the LEAK_NOISE matching the MEDIAN fired bin. Because m_fired spans
     ~100x across bins, dim bins see far more relative noise than this and bright
@@ -202,7 +196,7 @@ def dp_noise_to_leak_noise(sigma, fc1w_rms, m_fired, num_clients=1):
     import math
     if m_fired <= 0:
         raise ValueError("m_fired must be > 0 (no fired bins?)")
-    return math.sqrt(num_clients) * sigma * fc1w_rms / m_fired
+    return math.sqrt(num_clients) * sigma / m_fired
 # Client augmentation-strength toggle. MUST match the STRONG_AUG flag of the
 # federated run whose fragments will be inverted: it ~doubles the perturbation
 # strength of PRECOMPUTE_TF (see below) so the inverter trains on the exact view

@@ -43,7 +43,7 @@ DATA_DIR    = R.DATA_DIR
 # Client 0's exact partition is fully determined by (DATASET, NUM_CLIENTS, CLS_PER,
 # DATA_FRACTION, SEED) -- keep these identical to FedEMA_run.py so the ground truth
 # we recover is bit-for-bit the images that client actually trained on.
-DATASET     = "cifar10"
+DATASET     = "cifar100"
 NUM_CLIENTS = 5
 # classes_per_client (FedEMA_run.py CLASSES_PER_CLIENT) -- per-dataset default.
 CLS_PER     = {"tiny_imagenet": 40, "cifar100": 20}.get(DATASET, 2)

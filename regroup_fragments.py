@@ -15,13 +15,20 @@ from architectures import ResNet18Projv3
 # ---------------------------------------------------------------------------- #
 FRAG_DIR     = os.environ.get("FRAG_DIR", "fragments")
 CKPT         = os.environ.get("CKPT", "eval_model.pth")
+print(FRAG_DIR, CKPT)
 DATA_DIR     = R.DATA_DIR
 BATCH        = 512#4096
 
 BLANK_STD    = 0.05          # per-fragment raw std below this == blank
-K_NN         = 99#32            # neighbours per point in the kNN graph
-MIN_PTS      = 4             # min neighbours (incl. self) to be a core point
-EPS_SIM      = 0.9          # cosine-sim threshold (where the giant component dissolves)
+# K_NN caps how many neighbours can link a point, so it is implicitly tuned to the
+# expected cluster size -- ~99 rounds x f0 clean fragments per original. A round-
+# TRUNCATED arm (the round-cutoff test) has only ~6 rounds, so at K_NN=99 every
+# fragment's neighbourhood necessarily spans many originals and DBSCAN merges them
+# into a giant component. Env-overridable (default unchanged) so a truncated arm can
+# be re-run at a matched K_NN and the cutoff result separated from that artifact.
+K_NN         = int(os.environ.get("K_NN", "99"))#32   # neighbours per point in the kNN graph
+MIN_PTS      = int(os.environ.get("MIN_PTS", "4"))    # min neighbours (incl. self) to be a core point
+EPS_SIM      = float(os.environ.get("EPS_SIM", "0.9"))  # cosine-sim threshold (where the giant component dissolves)
 REFINE_CAP   = 99            # clusters above this are provably multi-original -> re-split
 REFINE_EPS   = (0.93,0.94,0.95, 0.96, 0.97, 0.98)
 SEED         = R.SEED
@@ -41,7 +48,7 @@ CANON_DEADBAND = 0.05        # |z - z0| below this: |cutoff| ~ 0, sign unreliabl
 # Output keyed to the arm so the canon/control runs never clobber each other; the
 # clusters-per-original drop between them is the over-split diagnostic (Remark 6).
 OUT_DIR      = os.environ.get(
-    "OUT_DIR", "fragments_clustered_canon" if SIGN_CANON else "fragments_clustered_control")
+    "OUT_DIR", "fragments_clustered")
 
 _MEAN = torch.tensor(R.CIFAR_MEAN).view(1, 3, 1, 1)
 _STD  = torch.tensor(R.CIFAR_STD).view(1, 3, 1, 1)

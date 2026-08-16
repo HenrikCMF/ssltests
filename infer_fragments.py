@@ -33,7 +33,7 @@ import reconstruction_test as R
 # (e.g. FRAG_DIR=fragments_clustered MIN_VIEWS=4 RECON_SUBDIR=cluster_recons python ...).
 FRAG_DIR    = os.environ.get("FRAG_DIR", "fragments")
 OUT_DIR     = os.path.join(R.OUT_DIR, os.environ.get("RECON_SUBDIR", "fragment_recons"))
-CKPT        = os.environ.get("CKPT", "reconstruction_out/best_leak_down_tinyimage_og.pt")   # inverter; env-overridable
+CKPT        = os.environ.get("CKPT", "reconstruction_out/best_leak_down32_0.05noise.pt")#"reconstruction_out/best_leak_down_tinyimage_og.pt")   # inverter; env-overridable
 FULL_COUNT  = int(os.environ.get("MIN_VIEWS", "99"))  # min round_*.pt to reconstruct a bin
 MAX_VIEWS   = R.NUM_PERTURB    # cap views fed (the model trains on up to this many)
 BATCH_BINS  = 64               # bins reconstructed per forward pass

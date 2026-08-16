@@ -28,7 +28,7 @@ from architectures import ResNet18Projv3
 from dataloader import CIFAR10BYOLClientData, CIFAR100BYOLClientData, TinyImageNetBYOLClientData
 
 EMBEDDING_SIZE = 2048          # must match training (FedEMA_run.py)
-CKPT = "eval_model_eps_1e+26.pth"
+CKPT = "eval_model_eps_1e+02.pth"
 
 # dataset -> (loader class, paper linear-eval baseline string or None)
 DATASETS = {
@@ -119,7 +119,7 @@ def linear_probe(train_feats, train_labels, test_feats, test_labels, device,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--dataset", default="cifar10", choices=sorted(DATASETS))
+    ap.add_argument("--dataset", default="cifar100", choices=sorted(DATASETS))
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--batch-size", type=int, default=512)
