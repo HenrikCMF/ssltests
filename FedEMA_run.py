@@ -34,8 +34,8 @@ EMBEDDING_SIZE     = 2048
 # ── Dataset selector ──────────────────────────────────────────────────────── #
 # "cifar10"       — 32×32 RGB, 10 classes, auto-downloaded via torchvision
 # "cifar100"      — 32×32 RGB, 100 classes, auto-downloaded via torchvision
-DATASET            = "cifar100"
-CLASSES_PER_CLIENT = 20#40    # non-IID shards per client (e.g. 2/10 for CIFAR-10, 20/100 for CIFAR-100, 20/200 for TinyIN)
+DATASET            = "cifar10"
+CLASSES_PER_CLIENT = 2#40    # non-IID shards per client (e.g. 2/10 for CIFAR-10, 20/100 for CIFAR-100, 20/200 for TinyIN)
 # Fraction of the training set to use, per class, for whichever DATASET is set
 # above. 1.0 = full dataset; 0.5 = half the samples but all classes preserved.
 DATASET_FRACTION   = 1
@@ -78,37 +78,24 @@ DP_CALIBRATE       = os.getenv("DP_CALIBRATE", "0") == "1" #default 0
 
 BYOL_BASE_LR     = 0.032  # LR at batch size 128; scaled linearly with batch size
 
-# FedEMA divergence-aware autoscaler (paper Algorithm 1). When True, each client
-# fuses its local model with the global one via mu = 1 - min(lambda_k*div, 1)
-# (dynamic, per-client). When False, mu = 1, i.e. plain FedBYOL: a pure-global
-# reset every round. Flip to False to fall back to the known-good FedBYOL path.
+# FedEMA divergence-aware autoscaler
 USE_AUTOSCALER     = False
 
-# torch.compile the client encoders/predictor for better GPU utilization. The
-# compiled models are built once per Ray-actor process and reused every round
-# (client._MODEL_CACHE), so the graph is NOT rebuilt each round — only the first
-# round pays the trace/autotune cost; the rest run the cached graph. Set False for
-# a byte-identical, eager A/B baseline.
+# torch.compile
 USE_COMPILE        = True
 
-# Overlap the ~2.25 GB per-client model save with the next client's load+train:
-# state is snapshotted to CPU synchronously, then serialized + written to disk on a
-# background thread instead of stalling the GPU between clients. Results are
-# unchanged (same bytes hit disk, just off the critical path). Set False to A/B.
+# Overlap the ~2.25 GB per-client model save with the next client's load+train
 USE_ASYNC_IO       = True
 
-# LOKI data-reconstruction attack (attacks.Loki, server.FedEMAStrategyWithKnn).
-# When True, the malicious server prepends a trap module to the encoder, arms it
-# for LOKI_TARGET_CID only each round, and reconstructs that client's images from
-# its returned update. Set False for a normal (unchanged) FedBYOL run. BYOL only.
+# LOKI data-reconstruction attack 
 from attacks import Loki, LokiConfig
 LOKI_ATTACK        = True
 LOKI_TARGET_CID    = 0
 
-LOKI_EXTRACT_ALL   = False
+LOKI_EXTRACT_ALL   = True
 LOKI_LOCAL_DATASET = int(os.getenv("TRAP_SIZE", "10000"))#256#   # number of target images the trap layer aims to leak
 LOKI_FC_MULT       = 4#4     # FC neurons per image (split-scaling headroom)
-LOKI_CSF           = 100000.0  # high CSF clears the fp32 precision floor in the FedAVG weight delta (Eq.10, CSF^2 scaling) -- low CSF collapses the leak with fc_size=40k + small SSL gradients
+LOKI_CSF           = float(os.getenv("LOKI_CSF", "100000.0"))  # high CSF clears the fp32 precision floor in the FedAVG weight delta (Eq.10, CSF^2 scaling) -- low CSF collapses the leak with fc_size=40k + small SSL gradients
 LOKI_SAVE_FRAGS    = LOKI_ATTACK  # dump per-bin .pt fragment stacks for offline reconstruction
 # The server-side LOKI work (arming in configure_fit, reconstruction in
 # aggregate_fit) is bursty, off the training-critical path, and only ever read

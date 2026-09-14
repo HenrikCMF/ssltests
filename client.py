@@ -267,25 +267,11 @@ class FedClient(fl.client.NumPyClient):
             # Case A: first round, or not selected last round — hard reset to global.
             self.trainer.reset_to_global(parameters)
         else:
-            # Case B: fuse the local model with the freshly received global one.
-            # Toggle on `mu`:
-            #   * use_autoscaler OFF -> mu = 1: the existing pure-global fast path
-            #     (FedBYOL), unchanged.
-            #   * use_autoscaler ON  -> mu != 1: FedEMA (paper Alg. 1, Eq. 1-3).
             if self.use_autoscaler:
-                # Measure divergence FIRST, without mutating the model, so mu can
-                # be chosen before blending (the Eq.3 -> Eq.1 order).
                 div = self.trainer.divergence_from_global(parameters)
-                # Lambda calibration now happens on the server; local computation
-                # disabled.
-                # if self.lambda_k is None:
-                #     # Autoscaler calibration, done once: makes mu_local == tau here.
-                #     self.lambda_k = self.tau / (div + 1e-12)
-                # Paper mu is the KEEP-LOCAL weight; blend_with_global's mu is the
-                # KEEP-GLOBAL weight, so pass its complement. div>0 keeps mu<1, so
-                # this never collides with the mu==1 fast path.
                 mu_local = min(self.lambda_k * div, 1.0)
                 mu = 1.0 - mu_local
+                #mu=0.95
             else:
                 mu = 1  # FedBYOL: pure global
 
@@ -477,28 +463,10 @@ class FedClient(fl.client.NumPyClient):
 
     def _load_local(self) -> bool:
         ok = self.trainer.load(self._weight_prefix)
-        # Lambda is now computed and distributed by the server, so it is no longer
-        # loaded from local disk here; fit() overwrites self.lambda_k from the
-        # server-sent config right after this call. Local load disabled.
-        # if ok:
-        #     if self.NUM_ROUND > 2:
-        #         try:
-        #             with open(self._lambda_path, "rb") as f:
-        #                 self.lambda_k = pickle.load(f)
-        #         except Exception:
-        #             self.lambda_k = None
-        #     else:
-        #         self.lambda_k = None
-        # else:
-        #     self.lambda_k = None
         return ok
 
     def _save_local(self) -> None:
         self.trainer.save(self._weight_prefix)
-        # Lambda is owned by the server now; local persistence disabled.
-        # if self.lambda_k is not None:
-        #     with open(self._lambda_path, "wb") as f:
-        #         pickle.dump(self.lambda_k, f)
 
 
 # Kept for backward compatibility with FedEMA_run.py (used by sd_float_arrays_bn).

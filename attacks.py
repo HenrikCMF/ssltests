@@ -107,8 +107,8 @@ class LokiModule(nn.Module):
         # is fc_size*C*H*W params — ~0.5 GB each in fp32), a large VRAM saving.
         # The fc1 leak is unaffected: autograd still flows *through* a frozen fc2
         # to fc1; the flag only stops fc2/conv from accumulating their own grad.
-        self.conv.weight.requires_grad_(False)
-        self.fc2.weight.requires_grad_(False)
+        #self.conv.weight.requires_grad_(False)
+        #self.fc2.weight.requires_grad_(False)
 
         # Activation choice depends on the federated mode:
         #   * FedAVG: Hardtanh (Eq. 4) — double-bounded, non-zero gradient only on
@@ -193,7 +193,6 @@ class Loki:
         # Per-client key value kv (Eq. 10): kv_new = CSF * kv. Defaults to CSF.
         self.kv = c.csf if c.fedavg else 1.0
 
-        self._template: Optional[LokiModule] = None
 
     # ------------------------------------------------------------------ #
     # 3.4 Convolutional parameters — identity mapping sets
@@ -339,64 +338,7 @@ class Loki:
         self._apply_fc_parameters(module)
         return module
 
-    # ------------------------------------------------------------------ #
-    # Client side (the only data-touching method): produce the update
-    # ------------------------------------------------------------------ #
-    def simulate_client_update(
-        self,
-        images: torch.Tensor,
-        active_cid: int,
-        downstream: Optional[nn.Module] = None,
-        mode: str = "fedsgd",
-        local_iters: int = 8,
-    ) -> torch.Tensor:
-        """
-        Stand-in for a client training the malicious model it was sent on its
-        private `images`. Returns FC1's weight *update* — the quantity the
-        server receives (a gradient for FedSGD, Theta_t - Theta_{t+1} for
-        FedAVG, Eq. 6). This is the boundary between client and server: only this
-        method sees raw data.
-
-        The leak is loss-agnostic (Sec. 3.5): the FC1 weight gradient is
-        (dL/dy_i) * input for any scalar loss L, so a simple surrogate suffices
-        when no `downstream` benign model is supplied.
-        """
-        images = images.to(self.device)
-        module = self.build_module(active_cid)
-
-        def loss_of(out_imgs: torch.Tensor) -> torch.Tensor:
-            if downstream is not None:
-                z = downstream(out_imgs)
-                return z.float().pow(2).mean()
-            # Surrogate: sum of the module output. Gives a constant dL/dy across
-            # the output, so each activated neuron's gradient is exactly its
-            # (scaled) input — the cleanest demonstration of the leak.
-            return out_imgs.float().sum()
-
-        if mode == "fedsgd":
-            # One local iteration over the whole batch -> a single gradient (Eq. 1).
-            module.zero_grad(set_to_none=True)
-            loss = loss_of(module(images, residual=downstream is not None))
-            loss.backward()
-            return module.fc1.weight.grad.detach().clone()
-
-        # FedAVG (Eq. 6): the server only sees Theta_t - Theta_{t+1}, the sum of
-        # the per-local-iteration gradients. The convolutional scaling factor
-        # (folded into kv / the FC weights, Eq. 10) is engineered so the leak
-        # layer's weights stay ~fixed across local iterations (Eq. 7) and so an
-        # image that already activated a neuron is pushed out of its Hardtanh band
-        # and cannot re-activate it in a later iteration (Sec. 3.6). Under that
-        # regime the parameter shift equals the accumulated per-mini-batch
-        # gradient, which we form directly here — each image is seen once.
-        module.zero_grad(set_to_none=True)
-        bs = max(1, len(images) // max(1, local_iters))
-        for it in range(local_iters):
-            batch = images[it * bs:(it + 1) * bs]
-            if len(batch) == 0:
-                break
-            loss_of(module(batch, residual=downstream is not None)).backward()
-        return module.fc1.weight.grad.detach().clone()
-
+    
     # ------------------------------------------------------------------ #
     # 3.5 De-aggregation & client identification
     # ------------------------------------------------------------------ #
@@ -406,13 +348,6 @@ class Loki:
         start = cid * elems
         return slice(start, start + elems)
 
-    def identify_client(self, cid: int) -> int:
-        """
-        Sec. 4.2: the identity mapping set used to reconstruct a sample *is* the
-        client id, so ownership survives aggregation/shuffling. Here it is the
-        block index; exposed as a method to mirror the paper's framing.
-        """
-        return cid
 
     # ------------------------------------------------------------------ #
     # 3.5 Reconstruction (server side, no data access) — Eq. 8 / Eq. 9
@@ -526,49 +461,6 @@ class Loki:
             return mass.bool()
         return mass > mass.max() * rel_floor
 
-    # ------------------------------------------------------------------ #
-    # Orchestration: full attack across clients, de-aggregate the target
-    # ------------------------------------------------------------------ #
-    def attack(
-        self,
-        client_images: Dict[int, torch.Tensor],
-        target_cid: int = 0,
-        downstream: Optional[nn.Module] = None,
-        mode: str = "fedsgd",
-        local_iters: int = 8,
-        bias_init: str = "observed",
-    ) -> torch.Tensor:
-        """
-        Run the end-to-end attack and return `target_cid`'s reconstructed
-        fragments.
-
-        Steps mirror a real round: (1) the server sets bias cutoffs (optionally
-        from observed brightness of the target — the converged learned
-        distribution); (2) each participating client trains the malicious model
-        it was sent on its own data; (3) the server securely aggregates the
-        updates (a plain sum here); (4) the server de-aggregates and reconstructs
-        the target client (Eq. 8/9).
-        """
-        # (1) Bias setup. "observed" uses the target client's brightness, the
-        # distribution the incremental learner converges to (Sec. 4.1).
-        if bias_init == "observed":
-            tgt = client_images[target_cid].to(self.device)
-            brightness = tgt.mean(dim=(1, 2, 3))                  # avg pixel intensity
-            self.setup_fc_biases("observed", brightness=brightness)
-        else:
-            self.setup_fc_biases(bias_init)
-
-        # (2)+(3) Each client produces an update; secure aggregation = sum.
-        agg = None
-        for cid, imgs in client_images.items():
-            upd = self.simulate_client_update(
-                imgs, active_cid=cid, downstream=downstream,
-                mode=mode, local_iters=local_iters,
-            )
-            agg = upd if agg is None else agg + upd
-
-        # (4) De-aggregate + reconstruct the target (Eq. 8/9).
-        return self.reconstruct(agg, target_cid)
 
     # ------------------------------------------------------------------ #
     # 4.3 Parameter / sparsity accounting
@@ -591,100 +483,6 @@ class Loki:
             "total_added": total,
             "nonzero_conv_params": nonzero_conv,
             "conv_sparsity_pct": int(100 * (1 - nonzero_conv / max(1, conv))),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Evaluation helpers (use ground truth — for measuring the demo only)
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _to_unit(img: torch.Tensor) -> torch.Tensor:
-        """Min-max normalize a [C,H,W] image to [0,1] for comparison/display."""
-        lo, hi = img.min(), img.max()
-        return (img - lo) / (hi - lo + 1e-8)
-
-    @classmethod
-    def ssim(cls, a: torch.Tensor, b: torch.Tensor) -> float:
-        """Global single-window SSIM on grayscale images in [0,1]."""
-        a = cls._to_unit(a).mean(0)
-        b = cls._to_unit(b).mean(0)
-        c1, c2 = 0.01 ** 2, 0.03 ** 2
-        mu_a, mu_b = a.mean(), b.mean()
-        va, vb = a.var(unbiased=False), b.var(unbiased=False)
-        cov = ((a - mu_a) * (b - mu_b)).mean()
-        num = (2 * mu_a * mu_b + c1) * (2 * cov + c2)
-        den = (mu_a ** 2 + mu_b ** 2 + c1) * (va + vb + c2)
-        return float(num / den)
-
-    def evaluate_leakage(
-        self, fragments: torch.Tensor, ground_truth: torch.Tensor, ssim_thresh: float = 0.5
-    ) -> Dict[str, object]:
-        """
-        Greedily match each reconstructed fragment to its best ground-truth image
-        by SSIM and count an image as *leaked* if SSIM > `ssim_thresh` (the
-        paper's leakage criterion, Sec. 5.1). Returns the leakage rate and the
-        per-ground-truth best fragment index (for display).
-        """
-        F_ = fragments.to(self.device)
-        G = ground_truth.to(self.device)
-        n_g = len(G)
-        n_f = len(F_)
-
-        # Vectorized global single-window SSIM matrix S[gi, fi]. The global SSIM is
-        # just per-image mean/var plus the cross-covariance, so the whole n_g x n_f
-        # grid is one matmul instead of n_g*n_f Python calls (orders of magnitude
-        # faster, and runs on the GPU).
-        def to_unit_flat(x: torch.Tensor) -> torch.Tensor:
-            # Match Loki.ssim exactly: per-image min-max over *all* channels first
-            # (_to_unit), then collapse to grayscale (channel mean), then flatten.
-            n, c, h, w = x.shape
-            flat_full = x.reshape(n, -1)                        # [N, C*H*W]
-            lo = flat_full.min(dim=1, keepdim=True).values
-            hi = flat_full.max(dim=1, keepdim=True).values
-            unit = (flat_full - lo) / (hi - lo + 1e-8)
-            gray = unit.reshape(n, c, h, w).mean(dim=1)         # [N, H, W]
-            return gray.reshape(n, -1)                          # [N, H*W]
-
-        Gf = to_unit_flat(G)                                    # [n_g, P]
-        Ff = to_unit_flat(F_)                                   # [n_f, P]
-        P = Gf.shape[1]
-        c1, c2 = 0.01 ** 2, 0.03 ** 2
-        mu_g = Gf.mean(dim=1)                                   # [n_g]
-        mu_f = Ff.mean(dim=1)                                   # [n_f]
-        var_g = Gf.var(dim=1, unbiased=False)                  # [n_g]
-        var_f = Ff.var(dim=1, unbiased=False)                  # [n_f]
-        # cov[g,f] = E[gf] - mu_g*mu_f, with E[gf] = (Gf @ Ff^T) / P
-        cov = (Gf @ Ff.t()) / P - mu_g[:, None] * mu_f[None, :]
-        num = (2 * mu_g[:, None] * mu_f[None, :] + c1) * (2 * cov + c2)
-        den = (mu_g[:, None] ** 2 + mu_f[None, :] ** 2 + c1) * \
-              (var_g[:, None] + var_f[None, :] + c2)
-        S = num / den                                          # [n_g, n_f]
-
-        # Greedy one-to-one assignment by descending SSIM (same semantics as the
-        # original), but driven off the matrix: repeatedly take the global argmax
-        # and mask out its row/column. min(n_g, n_f) cheap iterations instead of
-        # iterating a sorted list of n_g*n_f pairs.
-        best_idx = [-1] * n_g
-        best_ssim = [0.0] * n_g
-        M = S.clone()
-        neg = torch.finfo(M.dtype).min
-        for _ in range(min(n_g, n_f)):
-            flat = torch.argmax(M)
-            gi = int(flat // n_f)
-            fi = int(flat % n_f)
-            val = float(M[gi, fi])
-            if val <= neg / 2:
-                break                                          # nothing left to assign
-            best_idx[gi] = fi
-            best_ssim[gi] = val
-            M[gi, :] = neg
-            M[:, fi] = neg
-        leaked = sum(1 for s in best_ssim if s > ssim_thresh)
-        return {
-            "leaked": leaked,
-            "total": n_g,
-            "leakage_rate": leaked / max(1, n_g),
-            "best_idx": best_idx,
-            "best_ssim": best_ssim,
         }
 
     def save_round_fragments(
@@ -749,119 +547,3 @@ class Loki:
             if cutoffs.numel() == fragments.shape[0]:
                 payload["cutoffs"] = cutoffs.detach().cpu()[sel].float()
         torch.save(payload, os.path.join(root, f"round_{int(server_round):03d}.pt"))
-
-    def save_fragments_by_bin(
-        self,
-        fragments: torch.Tensor,
-        root: str,
-        server_round: int,
-        counts: Optional[torch.Tensor] = None,
-        clean_only: bool = True,
-    ) -> None:
-        """
-        Save each bin's fragment for this round under root/bin_XXXX/round_YYY.pt.
-
-        A bin (FC1 neuron) captures images in a fixed brightness band, a stable
-        property of the *underlying* image rather than its augmented view. So a
-        bin's folder accumulates the multiple augmented views of (probably) the
-        same original image across rounds -- exactly the per-image stack needed to
-        invert the known augmentation pipeline one image at a time.
-
-        If `counts` is given (the per-bin estimated number of contributing images
-        from the bias gradient, Sec. 3.5), each bin folder also gets an appended
-        info.csv row `round,bias_count`. A count of ~1 marks a clean single-image
-        capture; >1 is a blend, so the offline reconstructor can filter/weight by
-        it. `counts` is aligned 1:1 with the fragments (FedAVG: one per neuron;
-        FedSGD: one per consecutive-bin difference), so every saved bin has a
-        count; any trailing bin without one is recorded as empty.
-
-        Storage control: when `counts` is given, `clean_only` keeps only the
-        clean (count == 1) bins on disk -- the blended/empty bins are exactly
-        what the offline reconstructor discards anyway, and they are ~70% of
-        bins, so skipping them cuts the fragment dump several-fold without losing
-        anything it consumes. Bin indices stay stable (a bin is the same FC1
-        neuron every round), so a bin only accumulates round_*.pt for the rounds
-        in which it was clean. With `counts=None` (no diagnostic), all bins are
-        written as before.
-        """
-        n_counts = 0 if counts is None else int(counts.numel())
-        for i in range(fragments.shape[0]):
-            c = int(counts[i].item()) if (counts is not None and i < n_counts) else None
-            # Storage filter: persist every non-empty bin (count != 0), dropping
-            # only empty bins. The bias-mass count is an unreliable single-vs-blend
-            # signal under a real downstream loss (it inflates clean-bin counts), so
-            # blend rejection is deferred to the downstream quality filter.
-            if clean_only and counts is not None and (c is None or c == 0):
-                continue
-            bdir = os.path.join(root, f"bin_{i:04d}")
-            os.makedirs(bdir, exist_ok=True)
-            torch.save(
-                fragments[i].detach().cpu(),
-                os.path.join(bdir, f"round_{int(server_round):03d}.pt"),
-            )
-            if counts is not None:
-                info = os.path.join(bdir, "info.csv")
-                new_file = not os.path.exists(info)
-                with open(info, "a") as f:
-                    if new_file:
-                        f.write("round,bias_count\n")
-                    f.write(f"{int(server_round)},{'' if c is None else c}\n")
-
-    def save_fragments(
-        self,
-        fragments: torch.Tensor,
-        path: str,
-        ground_truth: Optional[torch.Tensor] = None,
-        eval_result: Optional[Dict[str, object]] = None,
-        max_show: int = 64,
-    ) -> None:
-        """
-        Save a PNG grid of reconstructed fragments (and, if provided, the matched
-        ground-truth images above them). De-normalizes via CIFAR stats only for
-        viewing. Requires matplotlib (already a project dependency).
-        """
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        if ground_truth is not None and eval_result is not None:
-            idx = eval_result["best_idx"]
-            gts = ground_truth[: max_show]
-            recons = [fragments[i] if i >= 0 else torch.zeros_like(fragments[0])
-                      for i in idx[: max_show]]
-            recons = torch.stack(recons)
-            n = len(gts)
-            cols = min(8, n)
-            rows = math.ceil(n / cols)
-            fig, axes = plt.subplots(rows * 2, cols, figsize=(cols * 1.3, rows * 2.6))
-            axes = np.atleast_2d(axes)
-            for r in range(rows):
-                for c in range(cols):
-                    k = r * cols + c
-                    ax_g = axes[r * 2][c]
-                    ax_r = axes[r * 2 + 1][c]
-                    ax_g.axis("off"); ax_r.axis("off")
-                    if k < n:
-                        ax_g.imshow(self._to_unit(gts[k]).permute(1, 2, 0).cpu().numpy())
-                        ax_r.imshow(self._to_unit(recons[k]).permute(1, 2, 0).cpu().numpy())
-            fig.suptitle(
-                f"LOKI reconstruction — leaked {eval_result['leaked']}/{eval_result['total']} "
-                f"({eval_result['leakage_rate']*100:.1f}%)  [top: ground truth, bottom: reconstruction]"
-            )
-        else:
-            show = fragments[: max_show]
-            n = len(show)
-            cols = min(8, n)
-            rows = math.ceil(n / cols)
-            fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.3, rows * 1.3))
-            axes = np.atleast_2d(axes)
-            for r in range(rows):
-                for c in range(cols):
-                    k = r * cols + c
-                    ax = axes[r][c]; ax.axis("off")
-                    if k < n:
-                        ax.imshow(self._to_unit(show[k]).permute(1, 2, 0).cpu().numpy())
-            fig.suptitle("LOKI reconstructed fragments")
-        fig.tight_layout()
-        fig.savefig(path, dpi=120, bbox_inches="tight")
-        plt.close(fig)
