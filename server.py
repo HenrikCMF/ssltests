@@ -4,7 +4,7 @@ from __future__ import annotations
 import gc
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import flwr as fl
@@ -21,6 +21,8 @@ from dataloader import CIFAR10BYOLClientData, CIFAR100BYOLClientData, TinyImageN
 import numpy as np
 from typing import List
 from attacks import Loki, LokiConfig
+from orchestra import global_clustering, pack_centroids, unpack_centroids
+from robust_aggregate import RandomAggregator
 
 # Suffix appended to every fixed output path so two runs can share the filesystem
 # (dp_eps_sweep.py runs one point per GPU concurrently). Empty => unchanged paths.
@@ -32,6 +34,79 @@ EVAL_MODEL_PATH = f"eval_model{RUN_TAG}.pth"
 #torch.backends.cuda.matmul.allow_tf32 = True
 #torch.backends.cudnn.allow_tf32 = True
 #torch.backends.cudnn.benchmark = False#True
+
+
+def parse_sacrifice_spec(spec, target_cid: int):
+    """Normalize ``LOKI_SACRIFICE_CID``.
+
+    Returns None (off), ``("single", (cid,))`` for one client at +C, or
+    ``("balanced", (cids...))`` / ``("all", ())`` for a -C/+C split.
+    ``"all"`` and ``"median"`` plant decoys on every client except the target.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, bool):
+        raise TypeError(
+            "loki_sacrifice_cid must be None, an int, 'all', or a list of client ids"
+        )
+    if isinstance(spec, (int, np.integer)):
+        cid = int(spec)
+        if cid == int(target_cid):
+            raise ValueError("loki_sacrifice_cid must differ from loki_target_cid")
+        return ("single", (cid,))
+    if isinstance(spec, str):
+        key = spec.strip().lower()
+        if key in ("all", "median"):
+            return ("all", ())
+        raise ValueError(f"loki_sacrifice_cid string must be 'all', got {spec!r}")
+    if isinstance(spec, (list, tuple)):
+        if len(spec) == 0:
+            raise ValueError("loki_sacrifice_cid list is empty")
+        cids = []
+        for x in spec:
+            if isinstance(x, bool) or not isinstance(x, (int, np.integer)):
+                raise TypeError(
+                    "loki_sacrifice_cid list entries must be client ids, "
+                    f"got {x!r}"
+                )
+            cids.append(int(x))
+        cids = tuple(sorted(set(cids)))
+        if int(target_cid) in cids:
+            raise ValueError("loki_sacrifice_cid must not include loki_target_cid")
+        if len(cids) == 1:
+            return ("single", cids)
+        return ("balanced", cids)
+    raise TypeError(
+        "loki_sacrifice_cid must be None, an int, 'all', or a list of client ids, "
+        f"got {type(spec).__name__}"
+    )
+
+
+def sacrifice_sign_map(spec, present_partitions, target_cid: int, decoy: float) -> Dict[int, float]:
+    """Map partition id -> FC1 constant for this round.
+
+    One decoy is +C (the original single-client sacrifice). Two or more are
+    split by sorted id: the lower half -C, the upper half +C. With four
+    decoys the uploads are [-C, -C, target_weight, C, C].
+    """
+    if spec is None:
+        return {}
+    mode, cids = spec
+    if mode == "single":
+        return {int(cids[0]): float(decoy)}
+    present = {int(p) for p in present_partitions if p is not None}
+    if mode == "all":
+        chosen = tuple(sorted(p for p in present if p != int(target_cid)))
+    else:
+        chosen = tuple(c for c in cids if c in present)
+    if not chosen:
+        return {}
+    if len(chosen) == 1:
+        return {chosen[0]: float(decoy)}
+    half = len(chosen) // 2
+    signs = {cid: -float(decoy) for cid in chosen[:half]}
+    signs.update({cid: float(decoy) for cid in chosen[half:]})
+    return signs
 
 
 def rss_gb() -> float:
@@ -170,10 +245,18 @@ class FedEMAStrategy(fl.server.strategy.FedAvg):
         where W_k^r is the client model returned this round (encoder only).
     """
 
-    def __init__(self, *, tau: float = 0.7, n_model_params: int, **kwargs):
+    def __init__(
+        self,
+        *,
+        tau: float = 0.7,
+        n_model_params: int,
+        aggregator: Optional[RandomAggregator] = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.state = FedEMAState(tau=tau)
         self.n_model_params = n_model_params  # how many arrays belong to encoder model (not predictor)
+        self.aggregator = aggregator
 
     def configure_fit(
         self,
@@ -212,15 +295,38 @@ class FedEMAStrategy(fl.server.strategy.FedAvg):
         return configured
 
     def aggregate_fit(self, server_round, results, failures):
-        aggregated = super().aggregate_fit(server_round, results, failures)
-        if aggregated is None:
+        if not results:
+            return None
+        if not self.accept_failures and failures:
             return None
 
-        params_agg, metrics_agg = aggregated
-        if params_agg is None:
-            # No successful client updates this round -> skip
-            return None
-        global_nd = parameters_to_ndarrays(params_agg)
+        if self.aggregator is None:
+            aggregated = super().aggregate_fit(server_round, results, failures)
+            if aggregated is None:
+                return None
+            params_agg, metrics_agg = aggregated
+            if params_agg is None:
+                return None
+            global_nd = parameters_to_ndarrays(params_agg)
+        else:
+            global_nd = self.aggregator(results)
+            params_agg = ndarrays_to_parameters(global_nd)
+            metrics_agg = {}
+            if self.fit_metrics_aggregation_fn:
+                fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
+                metrics_agg = self.fit_metrics_aggregation_fn(fit_metrics)
+            metrics_agg = dict(metrics_agg or {})
+            metrics_agg["agg_method"] = self.aggregator.last_method
+            elapsed = getattr(self.aggregator, "last_elapsed", None)
+            if elapsed is not None:
+                print(
+                    f"r{int(server_round)} aggregate: {self.aggregator.last_method}  "
+                    f"{elapsed:.2f}s",
+                    flush=True,
+                )
+            else:
+                print(f"r{int(server_round)} aggregate: {self.aggregator.last_method}", flush=True)
+
         global_model = global_nd[: self.n_model_params]
 
         # Autoscaler: set lambda_k once at earliest participation
@@ -244,8 +350,15 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
                  k=200, temperature=0.1, eval_model=None,
                  loki_config: Optional[LokiConfig] = None, loki_enabled: bool = False,
                  loki_target_cid: int = 0, loki_extract_all: bool = False,
+                 loki_secagg: bool = False, loki_arm_target_only: bool = False,
+                 loki_symmetric: bool = False,
+                 loki_sacrifice_cid: int | str | Sequence[int] | None = None,
+                 loki_sacrifice_decoy: float = 100.0,
                  loki_save_fragments: bool = True,
                  loki_fragments_dir: str = f"fragments{RUN_TAG}",
+                 orchestra_enabled: bool = False,
+                 orchestra_n_global: int = 64,
+                 orchestra_temperature: float = 0.1,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -263,13 +376,45 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         self.loki_enabled = loki_enabled
         self.loki = Loki(loki_config) if loki_enabled else None
         self.loki_target_cid = loki_target_cid
+        # Reconstruct from the reduced FC1 only (identity-mapping de-aggregation).
+        # Independent of RandomAggregator — FedAvg-after-aggregate is the paper attack.
+        self.loki_secagg = loki_secagg
+        # Sec. 4.4: one identity set, the same weights on every client.
+        # Disjoint sets, target-only arming, and sacrifice decoys are different
+        # models, so those flags do not apply here.
+        self.loki_symmetric = bool(loki_symmetric)
+        if self.loki_symmetric:
+            loki_extract_all = False
+            loki_arm_target_only = False
+            loki_sacrifice_cid = None
         # Full model inconsistency: arm every client with its own identity mapping
         # set and reconstruct all of them from the de-aggregated aggregate update
         # (Sec. 3.5/4.2). When False, only loki_target_cid is armed/reconstructed.
         self.loki_extract_all = loki_extract_all
+        # secagg + this flag: inert trap on every non-target client. extract_all
+        # still arms everyone. Individual mode already arms only the target.
+        self.loki_arm_target_only = bool(loki_arm_target_only) and not loki_extract_all
+        # Decoy FC1 constants (conv/bias/fc2 stay zero). None disables.
+        # An int is one client at +C. "all" / a list of ids is a -C/+C split
+        # so the median of [-C, -C, target, C, C] is the target weight.
+        # Only the target-only configure_fit path sends these.
+        self.loki_sacrifice_cid = loki_sacrifice_cid
+        self.loki_sacrifice_decoy = float(loki_sacrifice_decoy)
+        self.loki_sacrifice_spec = parse_sacrifice_spec(
+            loki_sacrifice_cid, self.loki_target_cid
+        )
+        if self.loki_sacrifice_spec is not None and self.loki_sacrifice_decoy <= 0.0:
+            raise ValueError("loki_sacrifice_decoy must be > 0")
+        self._sacrifice_signs: Dict[int, float] = {}
+        self._sacrifice_balance_noted = False
+        self._sacrifice_ignored_noted = False
         # Fragment dumping: per-bin .pt stacks for offline per-image reconstruction.
         self.loki_save_fragments = loki_save_fragments
         self.loki_fragments_dir = loki_fragments_dir
+        self.orchestra_enabled = bool(orchestra_enabled)
+        self.orchestra_n_global = int(orchestra_n_global)
+        self.orchestra_T = float(orchestra_temperature)
+        self._global_centroids = None  # [G, D] float32, set after round 1
         # Flower hands the strategy opaque ClientProxy ids; clients report their
         # partition id in fit metrics so we can find the target (built round 1).
         self._proxy_to_partition: Dict[str, int] = {}
@@ -343,15 +488,27 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         # Start from the FedEMA configuration (per-client lambda/selection config).
         pairs = super().configure_fit(server_round, parameters, client_manager)
         if not self.loki_enabled:
-            return pairs
+            return self._attach_orchestra_config(pairs)
 
-        if self.loki_extract_all:
-            return self._configure_fit_all(server_round, pairs)
+        if self.loki_symmetric:
+            return self._attach_orchestra_config(
+                self._configure_fit_symmetric(server_round, pairs)
+            )
 
-        # Model inconsistency: send the target client an armed trap module and
-        # every other client an inert (all-zero) module so they train the benign
-        # network untouched. Until the proxy->partition map is known (round 1),
-        # everyone is inert and the attack starts once the target is identified.
+        if self.loki_extract_all or (self.loki_secagg and not self.loki_arm_target_only):
+            if self.loki_sacrifice_spec is not None and not self._sacrifice_ignored_noted:
+                print("[LOKI] sacrifice decoys are only sent on the target-only "
+                      "path; this configuration arms every client and does not plant them")
+                self._sacrifice_ignored_noted = True
+            return self._attach_orchestra_config(
+                self._configure_fit_all(server_round, pairs)
+            )
+
+        # Model inconsistency: send the target an armed trap. Every other client
+        # gets a ±C decoy or an inert (all-zero) module, so they train the
+        # benign network untouched. Until the proxy->partition map is known
+        # (round 1), everyone is inert and the attack starts once the target
+        # is identified.
         #
         # Previous version deserialized the (identical) global model once PER
         # client and built fresh all-zero fc1/fc2 (~0.5 GB each) for every inert
@@ -368,28 +525,145 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         # return armed
 
         # The parent broadcasts the SAME global parameters to every client (only
-        # the per-client config differs), so deserialize it once and build just
-        # two payloads: one armed (target) and one inert (everyone else). Every
-        # non-target client is byte-identical, so they share a single serialized
-        # Parameters object instead of one per client. Both payloads also reuse
-        # the unchanged backbone arrays by reference (only the 4 module slots
-        # differ). This cuts configure_fit's peak host RAM several-fold.
+        # the per-client config differs), so deserialize it once and build one
+        # payload per distinct module: armed (target), inert (zeros), and at
+        # most two decoys (+C and -C). Clients with the same module share one
+        # serialized Parameters object. Payloads reuse the unchanged backbone
+        # arrays by reference (only the 4 module slots differ).
         base_nds = parameters_to_ndarrays(pairs[0][1].parameters)
         armed_params = None
+        pos_params = None
+        neg_params = None
         inert_params = None
+        # One zero trap. A decoy replaces only the FC1 slot with a new array;
+        # conv, bias, and fc2 stay the shared zeros. Serialization copies to
+        # bytes, so a later fill does not change an inert payload.
+        inert_nds = None
+        self._armed_cids = []
+        self._sacrifice_signs = sacrifice_sign_map(
+            self.loki_sacrifice_spec,
+            [self._proxy_to_partition.get(client.cid) for client, _ in pairs],
+            self.loki_target_cid,
+            self.loki_sacrifice_decoy,
+        )
+        self._note_sacrifice_balance()
         out = []
         for client, fitins in pairs:
             partition = self._proxy_to_partition.get(client.cid, None)
             if partition == self.loki_target_cid:
                 if armed_params is None:
-                    armed_params = ndarrays_to_parameters(
-                        self._arm_target_module(base_nds, server_round))
+                    armed_nds = self._arm_target_module(base_nds, server_round)
+                    armed_params = ndarrays_to_parameters(armed_nds)
+                    self._armed_cids.append(partition)
                 out.append((client, FitIns(armed_params, fitins.config)))
-            else:
-                if inert_params is None:
-                    inert_params = ndarrays_to_parameters(self._inert_module(base_nds))
-                out.append((client, FitIns(inert_params, fitins.config)))
+                continue
+            value = self._sacrifice_signs.get(partition) if partition is not None else None
+            if value is not None:
+                if inert_nds is None:
+                    inert_nds = self._inert_module(base_nds)
+                if value >= 0.0:
+                    if pos_params is None:
+                        pos_params = self._fc1_constant_parameters(inert_nds, value)
+                    out.append((client, FitIns(pos_params, fitins.config)))
+                else:
+                    if neg_params is None:
+                        neg_params = self._fc1_constant_parameters(inert_nds, value)
+                    out.append((client, FitIns(neg_params, fitins.config)))
+                continue
+            if inert_params is None:
+                if inert_nds is None:
+                    inert_nds = self._inert_module(base_nds)
+                inert_params = ndarrays_to_parameters(inert_nds)
+            out.append((client, FitIns(inert_params, fitins.config)))
+        return self._attach_orchestra_config(out)
+
+    def _fc1_constant_parameters(self, inert_nds, value: float):
+        """Inert trap with FC1 filled by `value`. Other trap slots stay shared zeros."""
+        nds = list(inert_nds)
+        _, w1, _, _ = self._module_slots(nds)
+        nds[w1] = np.full(inert_nds[w1].shape, float(value), dtype=inert_nds[w1].dtype)
+        return ndarrays_to_parameters(nds)
+
+    def _note_sacrifice_balance(self) -> None:
+        """Warn once if the -C/+C counts differ, so the median is not the target."""
+        if self._sacrifice_balance_noted:
+            return
+        signs = self._sacrifice_signs
+        if len(signs) < 2:
+            return
+        n_pos = sum(v > 0.0 for v in signs.values())
+        n_neg = len(signs) - n_pos
+        self._sacrifice_balance_noted = True
+        if n_pos == n_neg:
+            return
+        print(
+            f"[LOKI] sacrifice split is -{n_neg}/+{n_pos}. "
+            f"A median attack wants an even decoy count "
+            f"(K=5: two -C and two +C around the target) "
+            f"so every |target weight| < C is the middle value."
+        )
+
+    def _sacrifice_log_suffix(self) -> str:
+        spec = self.loki_sacrifice_spec
+        if spec is None:
+            return ""
+        C = self.loki_sacrifice_decoy
+        if spec[0] == "single":
+            return f", sac={spec[1][0]} decoy={C:g}"
+        signs = self._sacrifice_signs
+        n_pos = sum(v > 0.0 for v in signs.values())
+        n_neg = sum(v < 0.0 for v in signs.values())
+        if n_pos == 0 and n_neg == 0:
+            return f", sac={self.loki_sacrifice_cid} decoy={C:g}"
+        return f", sac=-{n_neg}/+{n_pos} decoy={C:g}"
+
+    def _attach_orchestra_config(self, pairs):
+        """Broadcast global centroids via fit config (not Flower parameters)."""
+        if not self.orchestra_enabled:
+            return pairs
+        out = []
+        for client, fitins in pairs:
+            cfg = dict(fitins.config) if fitins.config is not None else {}
+            if self._global_centroids is not None:
+                cfg["global_centroids"] = pack_centroids(self._global_centroids)
+                cfg["n_global"] = int(self._global_centroids.shape[0])
+                cfg["proj_dim"] = int(self._global_centroids.shape[1])
+            out.append((client, FitIns(fitins.parameters, cfg)))
         return out
+
+    def _orchestra_aggregate_centroids(self, results):
+        zs = []
+        for _, fit_res in results:
+            m = fit_res.metrics or {}
+            blob = m.get("local_centroids")
+            if not blob:
+                continue
+            n_l = int(m.get("n_local", 0) or 0)
+            d = int(m.get("proj_dim", 0) or 0)
+            if n_l <= 0 or d <= 0:
+                continue
+            zs.append(unpack_centroids(blob, n_l, d))
+        if not zs:
+            return
+        Z = np.concatenate(zs, axis=0)
+        self._global_centroids = global_clustering(
+            Z, n_global=self.orchestra_n_global, temperature=self.orchestra_T,
+        )
+
+    def _configure_fit_symmetric(self, server_round, pairs):
+        """
+        No model inconsistency (Sec. 4.4): one identity set, one payload.
+
+        Every client gets that same Parameters object, so a broadcast check
+        sees one model. Bins are shared. Reconstruction reads identity block 0
+        from armed - aggregate (Eq. 9 cancels the 1/N).
+        """
+        base_nds = parameters_to_ndarrays(pairs[0][1].parameters)
+        armed_nds = self._arm_target_module(base_nds, server_round)
+        armed_params = ndarrays_to_parameters(armed_nds)
+        # Block 0 is the only identity set. TARGET_CID is not a block index.
+        self._armed_cids = [0]
+        return [(client, FitIns(armed_params, fitins.config)) for client, fitins in pairs]
 
     def _configure_fit_all(self, server_round, pairs):
         """
@@ -446,17 +720,24 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
                 pid = (fit_res.metrics or {}).get("cid")
                 if pid is not None:
                     self._proxy_to_partition[client.cid] = int(pid)
-            if self.loki_extract_all:
-                # Reconstruct every armed client from the de-aggregated aggregate.
-                if self._armed_fc1 is not None and self._armed_cids:
-                    self._loki_reconstruct_all(server_round, results)
-            elif self._armed_fc1 is not None:
-                # Single target: reconstruct from its individual update.
-                for client, fit_res in results:
-                    if self._proxy_to_partition.get(client.cid) == self.loki_target_cid:
-                        self._loki_reconstruct(server_round, fit_res)
-                        break
+            if not self.loki_secagg:
+                if self.loki_extract_all:
+                    if self._armed_fc1 is not None and self._armed_cids:
+                        self._loki_reconstruct_all(server_round, results)
+                elif self._armed_fc1 is not None:
+                    for client, fit_res in results:
+                        if self._proxy_to_partition.get(client.cid) == self.loki_target_cid:
+                            self._loki_reconstruct(server_round, fit_res)
+                            break
         agg = super().aggregate_fit(server_round, results, failures)
+        if (self.loki_enabled and self.loki_secagg and self._armed_fc1 is not None
+                and self._armed_cids and agg is not None and agg[0] is not None):
+            _, w1, _, _ = self._module_slots(None)
+            self._loki_reconstruct_all(
+                server_round, results, agg_w=bytes_to_ndarray(agg[0].tensors[w1]),
+            )
+        if self.orchestra_enabled:
+            self._orchestra_aggregate_centroids(results)
         # DIAGNOSTIC: force collection then report server RSS so a steady climb
         # (true leak) is distinguishable from GC lag. Remove once memory is traced.
         gc.collect()
@@ -581,89 +862,113 @@ class FedEMAStrategyWithKnn(FedEMAStrategy):
         del upd_w, upd_b, ret_w1, ret_b1, frags, counts
         gc.collect()
 
-    def _loki_reconstruct_all(self, server_round, results):
+    def _loki_reconstruct_all(self, server_round, results, agg_w=None):
         """
-        Full model inconsistency reconstruction (Sec. 3.5/4.2): form the secure
-        aggregate of the armed clients' FC1 weight updates and de-aggregate every
-        client from its own block.
+        Full model inconsistency reconstruction (Sec. 3.5/4.2): de-aggregate
+        each client from its own FC1 block of the (aggregated) weight update.
 
-        The binning FC1 sent was identical for all clients, so the aggregated
-        weight "gradient" (Eq. 6 with secure-agg = sum) is n*armed - sum(returned).
-        Each client's images sit in a disjoint block of FC1's input (its identity
-        mapping set), and a client that did not own a block contributes ~0 there,
-        so reconstructing block k recovers client k. The FC1 *bias* gradient is
-        coupled across clients by aggregation and so cannot give a per-client
-        count; the per-client fired/empty signal is therefore read from the
-        de-aggregated *weight* block (reconstruct_with_fired).
+        Without `agg_w` the updates are summed from `results` (n*armed - sum).
+        With `agg_w` (secagg mode) only the reduced FC1 is available:
+          arm-all and secagg_symmetric:
+                     armed - agg           (everyone started from W_armed;
+                     Eq. 9 cancels 1/n). Symmetric has one shared block.
+          target-only: armed - n*agg       (others returned zeros on the trap,
+                     so n*agg is the target's returned FC1). A decoy is not a
+                     second copy of W, so the same formula applies. One +C is
+                     an outlier a trimmed mean drops. Balanced -C/+C cancel in
+                     a mean, and while |target weight| < C the coordinate-wise
+                     median is the target weight. Eq. 9 cancels the scale this
+                     leaves on the imprint.
         """
-        _, w1, _, _ = self._module_slots(None)
         armed = set(self._armed_cids)
-
-        # Securely aggregate (sum) the armed clients' returned FC1 weights.
-        sum_w = None
-        n = 0
-        for client, fit_res in results:
-            if self._proxy_to_partition.get(client.cid) not in armed:
-                continue
-            rw = bytes_to_ndarray(fit_res.parameters.tensors[w1])
-            if sum_w is None:
-                sum_w = rw                       # take ownership of the first array
-            else:
-                sum_w += rw
-            n += 1
-        if sum_w is None:
+        if agg_w is not None:
+            n = max(len(results), 1)
+            # In-place, no third FC1 allocation. arm-all and secagg_symmetric:
+            # one subtract (everyone started from W_armed; Eq. 9 eats 1/n).
+            # target-only: n subtracts so zeros from inert clients drop out.
+            n_sub = n if self.loki_arm_target_only else 1
+            for _ in range(n_sub):
+                self._armed_fc1 -= agg_w
+            upd_w = torch.from_numpy(self._armed_fc1)
             self._armed_fc1 = None
             self._armed_bias = None
-            return
-
-        # Eq. 6 aggregated weight gradient: n*armed - sum(returned), in place to
-        # avoid a third multi-GB array.
-        self._armed_fc1 *= n
-        self._armed_fc1 -= sum_w
-        upd_w = torch.from_numpy(self._armed_fc1)
-        del sum_w
-        self._armed_fc1 = None
-        self._armed_bias = None
+        else:
+            _, w1, _, _ = self._module_slots(None)
+            sum_w = None
+            n = 0
+            for client, fit_res in results:
+                if self._proxy_to_partition.get(client.cid) not in armed:
+                    continue
+                rw = bytes_to_ndarray(fit_res.parameters.tensors[w1])
+                if sum_w is None:
+                    sum_w = rw
+                else:
+                    sum_w += rw
+                n += 1
+            if sum_w is None:
+                self._armed_fc1 = None
+                self._armed_bias = None
+                return
+            self._armed_fc1 *= n
+            self._armed_fc1 -= sum_w
+            upd_w = torch.from_numpy(self._armed_fc1)
+            del sum_w
+            self._armed_fc1 = None
+            self._armed_bias = None
 
         cutoffs = self.loki.cutoffs
         if not self.loki.cfg.fedavg:
             cutoffs = cutoffs[:-1]
 
+        agg_method = None
+        if self.loki_secagg:
+            agg_method = getattr(self.aggregator, "last_method", None) or "fedavg"
+        if self.loki_symmetric or self.loki_arm_target_only:
+            # Both build identity set 0. Symmetric broadcasts it; target-only
+            # sends it to TARGET_CID. The block index is 0 either way.
+            # Symmetric always reads it. Target-only reads it only if that
+            # client was actually armed this round.
+            cids = [0] if self.loki_symmetric or self.loki_target_cid in armed else []
+        else:
+            cids = (sorted(armed) if self.loki_extract_all or not self.loki_secagg
+                    else [c for c in (self.loki_target_cid,) if c in armed])
+
         fired_cutoffs = []
         total = 0
-        for cid in sorted(armed):
+        for cid in cids:
             frags, mass = self.loki.reconstruct_with_fired(upd_w, target_cid=cid)
             fired = self.loki.fired_mask(mass)
             if bool(fired.any()):
                 fired_cutoffs.extend(cutoffs.to(fired.device)[fired].cpu().tolist())
                 if cid == 0:
-                    # m_fired = median max-abs of a fired bin's Eq.9 source row (the
-                    # per-bin normalizer). Paired with the client's logged DP sigma,
-                    # this pins the sandbox LEAK_NOISE equivalent:
-                    # LEAK_NOISE ~= sqrt(K) * sigma / m_fired  (see reconstruction_test
-                    # .dp_noise_to_leak_noise). Logged because sigma << peak(m_fired)
-                    # is exactly the sparsity confound that makes equal values diverge.
                     fm = mass[fired]
-                    print(f"r{int(server_round)} loki(cid0): m_fired median={fm.median():.4g} "
+                    if self.loki_symmetric:
+                        tag = (f"secagg_symmetric, {agg_method}" if agg_method
+                               else "secagg_symmetric")
+                    else:
+                        tag = f"secagg, {agg_method}" if agg_method else "cid0"
+                    if self.loki_arm_target_only:
+                        tag += ", target_only"
+                        tag += self._sacrifice_log_suffix()
+                    print(f"r{int(server_round)} loki({tag}): m_fired median={fm.median():.4g} "
                           f"min={fm.min():.4g} max={fm.max():.4g}  n_fired={int(fired.sum())} "
                           f"[Eq.9 denom; use with dp sigma -> LEAK_NOISE]")
             if self.loki_save_fragments:
-                # Per-client subdir so reconstructed data stays tied to its owner
-                # (Sec. 4.2). counts=fired marks the kept (non-empty) bins.
-                cdir = os.path.join(self.loki_fragments_dir, f"client_{cid:02d}")
+                cdir = (os.path.join(self.loki_fragments_dir, f"client_{cid:02d}")
+                        if self.loki_extract_all else self.loki_fragments_dir)
                 self.loki.save_round_fragments(
-                    frags, cdir, server_round, counts=fired.long()
+                    frags, cdir, server_round, counts=fired.long(),
+                    agg_method=agg_method,
                 )
             total += int(fired.sum())
             del frags, mass, fired
 
-        # Bias-distribution learning from every fired bin across all clients
-        # (the binning FC1/bias is shared, so the distribution is global).
         if fired_cutoffs:
             self.loki.learn_bias_distribution(fired_cutoffs)
 
         print(f"[LOKI] round {int(server_round)}: reconstructed {total} fragments "
-              f"across {len(armed)} clients")
+              f"across {len(cids)} clients"
+              + (f" ({agg_method})" if agg_method else ""))
         del upd_w
         gc.collect()
 

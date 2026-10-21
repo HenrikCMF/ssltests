@@ -492,6 +492,7 @@ class Loki:
         server_round: int,
         counts: Optional[torch.Tensor] = None,
         clean_only: bool = True,
+        agg_method: Optional[str] = None,
     ) -> None:
         """
         Save a whole round's fragments as a single file root/round_XXX.pt.
@@ -546,4 +547,6 @@ class Loki:
                 cutoffs = cutoffs[:-1]      # align to the difference fragments
             if cutoffs.numel() == fragments.shape[0]:
                 payload["cutoffs"] = cutoffs.detach().cpu()[sel].float()
+        if agg_method is not None:
+            payload["agg_method"] = agg_method
         torch.save(payload, os.path.join(root, f"round_{int(server_round):03d}.pt"))

@@ -10,24 +10,42 @@ from torchvision.models.resnet import ResNet, BasicBlock
 from torchvision import datasets, transforms, models
 from attacks import LokiModule
 
+ORCHESTRA_PROJ_DIM = 512
+
+
 def build_models(emb_dim=2048, loki=False, loki_image_shape=(3, 32, 32),
-                 loki_fc_size=1024, loki_num_kernels=3):
+                 loki_fc_size=1024, loki_num_kernels=3, ssl_method="byol"):
     """
-    Build the BYOL encoders/predictors. When `loki=True` the three encoders are
-    wrapped so a LOKI attack module (conv identity-map + 2 FC layers) is prepended
-    at the network input — this is what gives the malicious server a fully-
-    connected layer that sees the raw image, enabling linear-layer leakage. The
-    module is shape-preserving (residual passthrough), so with an all-zero / inert
-    module the encoder behaves exactly like the benign ResNet18. When `loki=False`
-    the function returns the original benign architecture unchanged.
+    Build the SSL encoders (and the BYOL predictor). When `loki=True` the
+    encoders are wrapped so a LOKI attack module (conv identity-map + 2 FC
+    layers) is prepended at the network input — this is what gives the malicious
+    server a fully-connected layer that sees the raw image, enabling linear-layer
+    leakage. The module is shape-preserving (residual passthrough), so with an
+    all-zero / inert module the encoder behaves exactly like the benign ResNet18.
+    When `loki=False` the function returns the original benign architecture
+    unchanged.
+
+    `ssl_method`:
+      "byol"      — current projector (512→4096→emb_dim) + predictor.
+      "orchestra" — paper/official 2-layer 512-d projector, no predictor.
     """
+    if ssl_method not in ("byol", "orchestra"):
+        raise ValueError(f"ssl_method must be 'byol' or 'orchestra', got {ssl_method!r}")
+    projector = "orchestra" if ssl_method == "orchestra" else "byol"
+    enc_emb = ORCHESTRA_PROJ_DIM if ssl_method == "orchestra" else emb_dim
+
     def make_encoder():
         if loki:
-            return LokiEncoder(emb_dim, loki_image_shape, loki_fc_size, loki_num_kernels)
-        return ResNet18Projv3(emb_dim=emb_dim)
+            return LokiEncoder(
+                enc_emb, loki_image_shape, loki_fc_size, loki_num_kernels,
+                projector=projector,
+            )
+        return ResNet18Projv3(emb_dim=enc_emb, projector=projector)
 
     EMA = make_encoder()
     model = make_encoder()
+    if ssl_method == "orchestra":
+        return model, EMA, None
     predictor = nn.Sequential(
             nn.Linear(emb_dim, 4096),
             nn.BatchNorm1d(4096),
@@ -67,22 +85,45 @@ class CIFARResNet18Backbone(ResNet):
         x = torch.flatten(x, 1)
         return x  # [B, 512]
 
+class projection_MLP_orchestra(nn.Module):
+    """Official Orchestra projector (Lubana et al. ICML 2022 / akhilmathurs/orchestra).
+
+    2-layer MLP with 512 units, SimCLR-style: Linear(bias=False)→BN→ReLU then
+    Linear(bias=False)→BN(affine=False). Output dim is 512.
+    """
+
+    def __init__(self, in_dim=512, hidden_dim=512, out_dim=512):
+        super().__init__()
+        self.layer1 = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.layer1_bn = nn.BatchNorm1d(hidden_dim, affine=True)
+        self.layer2 = nn.Linear(hidden_dim, out_dim, bias=False)
+        self.layer2_bn = nn.BatchNorm1d(out_dim, affine=False)
+
+    def forward(self, x):
+        x = F.relu(self.layer1_bn(self.layer1(x)))
+        x = self.layer2_bn(self.layer2(x))
+        return x
+
+
 class ResNet18Projv3(nn.Module):
-    def __init__(self, emb_dim=2048):
+    def __init__(self, emb_dim=2048, projector="byol"):
         super().__init__()
         self.backbone = CIFARResNet18Backbone()
-
-        self.proj = nn.Sequential(
-            nn.Linear(512, 4096),
-            nn.BatchNorm1d(4096),
-            nn.ReLU(inplace=True),
-            nn.Linear(4096, emb_dim),
-
-        )
+        if projector == "orchestra":
+            self.proj = projection_MLP_orchestra(
+                in_dim=512, hidden_dim=ORCHESTRA_PROJ_DIM, out_dim=ORCHESTRA_PROJ_DIM,
+            )
+        else:
+            self.proj = nn.Sequential(
+                nn.Linear(512, 4096),
+                nn.BatchNorm1d(4096),
+                nn.ReLU(inplace=True),
+                nn.Linear(4096, emb_dim),
+            )
 
     def forward(self, x, normalize=False):
         h = self.backbone(x)          # [B,512]
-        z = self.proj(h)              # [B,2048]
+        z = self.proj(h)
         return F.normalize(z, dim=1) if normalize else z
 
     @torch.no_grad()
@@ -102,14 +143,15 @@ class LokiEncoder(nn.Module):
     == input, zero gradient), so a non-target client trains the benign network
     untouched. When armed with trap weights it leaks the target's images through
     fc1's weight gradient while still passing the (near-unchanged) image to the
-    backbone for normal training. Mirrors ResNet18Projv3's interface so SSL,
-    FedEMA and the kNN eval use it unchanged.
+    backbone for normal training. Mirrors ResNet18Projv3's interface so BYOL,
+    Orchestra, FedEMA and the kNN eval use it unchanged.
     """
 
-    def __init__(self, emb_dim=2048, image_shape=(3, 32, 32), fc_size=1024, num_kernels=3):
+    def __init__(self, emb_dim=2048, image_shape=(3, 32, 32), fc_size=1024,
+                 num_kernels=3, projector="byol"):
         super().__init__()
         self.loki = LokiModule(image_shape, fc_size, num_kernels, fedavg=True)
-        self.net = ResNet18Projv3(emb_dim=emb_dim)
+        self.net = ResNet18Projv3(emb_dim=emb_dim, projector=projector)
 
     def forward(self, x, normalize=False):
         return self.net(self.loki(x, residual=True), normalize=normalize)

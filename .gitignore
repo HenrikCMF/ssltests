@@ -15,3 +15,5 @@ data/tiny-imagenet-200/
 *.md
 *.log
 *.mat
+*.pdf
+*.tex

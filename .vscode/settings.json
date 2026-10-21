@@ -1,5 +1,50 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python.defaultInterpreterPath": "/home/henrik/miniconda3/envs/flwr/bin/python"
+    "python.defaultInterpreterPath": "/home/henrik/miniconda3/envs/flwr/bin/python",
+
+    // Pylance was crash-looping (JS heap OOM at ~4GB) because it walked the
+    // whole workspace: ~3.2M files, almost all experiment artifacts, only 25 .py
+    // sources. Restrict analysis to those sources and keep the file watcher off
+    // the artifact trees.
+    "python.analysis.include": ["*.py"],
+    "python.analysis.exclude": [
+        "**/fragments_*/**",
+        "**/local_weights*/**",
+        "**/reconstruction_out/**",
+        "**/recon_cache/**",
+        "**/data/**",
+        "**/dp_*_out/**",
+        "**/trap_sweep_out/**",
+        "**/csf_sweep_out/**",
+        "**/cid0_compare/**",
+        "**/arm_logs/**",
+        "**/temp_files/**"
+    ],
+    "python.analysis.diagnosticMode": "openFilesOnly",
+    "python.analysis.nodeArguments": ["--max-old-space-size=8192"],
+
+    "files.watcherExclude": {
+        "**/fragments_*/**": true,
+        "**/local_weights*/**": true,
+        "**/reconstruction_out/**": true,
+        "**/recon_cache/**": true,
+        "**/data/**": true,
+        "**/dp_*_out/**": true,
+        "**/trap_sweep_out/**": true,
+        "**/csf_sweep_out/**": true,
+        "**/*.pt": true,
+        "**/*.pth": true
+    },
+    "search.exclude": {
+        "**/fragments_*/**": true,
+        "**/local_weights*/**": true,
+        "**/reconstruction_out/**": true,
+        "**/recon_cache/**": true,
+        "**/data/**": true,
+        "**/*.pt": true,
+        "**/*.pth": true
+    },
+    "files.exclude": {
+    }
 }

@@ -28,7 +28,7 @@ from architectures import ResNet18Projv3
 from dataloader import CIFAR10BYOLClientData, CIFAR100BYOLClientData, TinyImageNetBYOLClientData
 
 EMBEDDING_SIZE = 2048          # must match training (FedEMA_run.py)
-CKPT = "eval_model.pth"
+CKPT = "eval_model_csf_1e5.pth"
 
 # dataset -> (loader class, paper linear-eval baseline string or None)
 DATASETS = {

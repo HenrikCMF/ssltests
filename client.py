@@ -12,8 +12,9 @@ import torch
 import flwr as fl
 from pathlib import Path
 from dataloader import CIFAR10BYOLClientData, CIFAR100BYOLClientData, TinyImageNetBYOLClientData
-from architectures import build_models
-from SSL import SimpleBYOL
+from architectures import build_models, ORCHESTRA_PROJ_DIM
+from BYOL import SimpleBYOL
+from orchestra import SimpleOrchestra, pack_centroids, unpack_centroids
 from dp_accounting import noise_std_for_eps
 import pickle
 
@@ -36,24 +37,25 @@ _DATASET_VERIFIED = False
 _DATA_CACHE = {}
 
 # Per-process cache of the built (and, when use_compile, torch.compiled) model
-# triple (online, target, predictor), keyed on the architecture signature. Flower
-# reuses each Ray actor process across rounds, so building + compiling ONCE here
-# and handing the SAME module objects to every round's trainer is what lets
+# triple (online, target, predictor-or-None), keyed on the architecture signature.
+# Flower reuses each Ray actor process across rounds, so building + compiling ONCE
+# here and handing the SAME module objects to every round's trainer is what lets
 # torch.compile keep its graph: the weight-update paths (SimpleBYOL._set_sd_floats
-# and load_state_dict) copy in place, preserving every parameter tensor's identity
-# and metadata, so no Dynamo guard is invalidated and no recompile happens after
-# round 1. Capacity 1 (the arch key is constant within a run): on any signature
-# change the old triple is dropped first, so at most one — possibly large —
-# compiled model set is resident per actor. That also removes the model-stacking
-# release_gpu guarded against, since each client loads its weights into these same
-# resident tensors instead of allocating a fresh model.
+# / SimpleOrchestra._set_sd_floats and load_state_dict) copy in place, preserving
+# every parameter tensor's identity and metadata, so no Dynamo guard is invalidated
+# and no recompile happens after round 1. Capacity 1 (the arch key is constant
+# within a run): on any signature change the old triple is dropped first, so at
+# most one — possibly large — compiled model set is resident per actor. That also
+# removes the model-stacking release_gpu guarded against, since each client loads
+# its weights into these same resident tensors instead of allocating a fresh model.
 _MODEL_CACHE = {}
 
 
 def _build_or_get_models(dataset: str, embedding_size: int, loki: bool,
                          loki_fc_size: int, loki_num_kernels: int,
-                         loki_image_shape, use_compile: bool):
-    """Return the (online, target, predictor) triple for this architecture.
+                         loki_image_shape, use_compile: bool,
+                         ssl_method: str = "byol"):
+    """Return the (online, target, predictor-or-None) triple for this architecture.
 
     With use_compile the triple is built + compiled once per process and reused
     every round (see _MODEL_CACHE). Without it, a fresh triple is built each round
@@ -62,9 +64,10 @@ def _build_or_get_models(dataset: str, embedding_size: int, loki: bool,
         return build_models(
             emb_dim=embedding_size, loki=loki, loki_image_shape=loki_image_shape,
             loki_fc_size=loki_fc_size, loki_num_kernels=loki_num_kernels,
+            ssl_method=ssl_method,
         )
 
-    key = (dataset, embedding_size, loki, loki_fc_size, loki_num_kernels)
+    key = (dataset, embedding_size, loki, loki_fc_size, loki_num_kernels, ssl_method)
     triple = _MODEL_CACHE.get(key)
     if triple is None:
         # Drop any resident triple for a different arch first so we never hold two
@@ -73,6 +76,7 @@ def _build_or_get_models(dataset: str, embedding_size: int, loki: bool,
         model, ema, predictor = build_models(
             emb_dim=embedding_size, loki=loki, loki_image_shape=loki_image_shape,
             loki_fc_size=loki_fc_size, loki_num_kernels=loki_num_kernels,
+            ssl_method=ssl_method,
         )
         # Compile IN PLACE (nn.Module.compile) rather than reassigning to a
         # torch.compile(...) wrapper: in place keeps the same object, class and
@@ -80,12 +84,13 @@ def _build_or_get_models(dataset: str, embedding_size: int, loki: bool,
         # array-count split / the DP key mapping all stay byte-for-byte identical.
         # dynamic=False locks the fixed (drop_last=True) batch shape to one static
         # graph. Compilation is lazy — it traces on the first CUDA forward inside
-        # train(), after SimpleBYOL has moved these to the GPU. The online encoder
-        # and predictor are always uniform fp32 and safe to compile; the target
-        # encoder is compiled only when NOT loki, because a loki target carries a
-        # deliberately bf16 trap sub-module (mixed dtype) and is left eager.
+        # train(), after the trainer has moved these to the GPU. The online encoder
+        # (and predictor, when present) are always uniform fp32 and safe to compile;
+        # the target encoder is compiled only when NOT loki, because a loki target
+        # carries a deliberately bf16 trap sub-module (mixed dtype) and is left eager.
         model.compile(dynamic=False)
-        predictor.compile(dynamic=False)
+        if predictor is not None:
+            predictor.compile(dynamic=False)
         if not loki:
             ema.compile(dynamic=False)
         triple = (model, ema, predictor)
@@ -119,7 +124,14 @@ class FedClient(fl.client.NumPyClient):
                  dp_calibrate: bool = False,
                  use_autoscaler: bool = False,
                  use_compile: bool = False,
-                 use_async_save: bool = False):
+                 use_async_save: bool = False,
+                 ssl_method: str = "byol",
+                 orchestra_base_lr: float = 0.01,
+                 orchestra_n_local: int = 8,
+                 orchestra_n_global: int = 64,
+                 orchestra_memory_size: int = 2048,
+                 orchestra_temperature: float = 0.1,
+                 orchestra_ema: float = 0.99):
         self.cid          = int(cid)
         self.local_epochs = local_epochs
         # Rounds this client will participate in. fraction_fit=1.0 means every
@@ -170,14 +182,19 @@ class FedClient(fl.client.NumPyClient):
         # FedEMA divergence-aware autoscaler toggle. When False, blending uses
         # mu = 1 (the pure-global fast path == FedBYOL). When True, mu is the
         # dynamic per-client value from paper Eq. 3 and the corrected blend runs.
-        self.use_autoscaler = bool(use_autoscaler)
+        # Orchestra uses FedAvg of the online encoder (mu=1); the FedEMA
+        # autoscaler is a BYOL-only toggle.
+        self.use_autoscaler = bool(use_autoscaler) and ssl_method != "orchestra"
         # torch.compile the encoders/predictor once per process and reuse them
         # across rounds so the compiled graph never has to be rebuilt. See
         # _build_or_get_models / _MODEL_CACHE and SimpleBYOL.release_gpu.
         self.use_compile = bool(use_compile)
         # Overlap the ~2.25 GB per-client model save with the next client's
-        # load+train by writing it on a background thread (SimpleBYOL.save).
+        # load+train by writing it on a background thread (trainer.save).
         self.use_async_save = bool(use_async_save)
+        if ssl_method not in ("byol", "orchestra"):
+            raise ValueError(f"ssl_method must be 'byol' or 'orchestra', got {ssl_method!r}")
+        self.ssl_method = ssl_method
         # When True the BYOL encoder carries a (gated) LOKI attack module at its
         # input; the malicious server arms it for this client only if it is the
         # attack target (see server.FedEMAStrategyWithKnn).
@@ -189,7 +206,8 @@ class FedClient(fl.client.NumPyClient):
         self._lambda_path   = f"{LOCAL_WEIGHTS}/lambda{self.cid}.pkl"
 
         # Reuse the per-process data object across rounds (see _DATA_CACHE).
-        cache_key = (self.cid, num_partitions, batch_size, dataset, data_fraction, strong_aug)
+        cache_key = (self.cid, num_partitions, batch_size, dataset, data_fraction,
+                     strong_aug, ssl_method)
         data_obj = _DATA_CACHE.get(cache_key)
         if data_obj is None:
             global _DATASET_VERIFIED
@@ -213,13 +231,11 @@ class FedClient(fl.client.NumPyClient):
                 download=download,
                 data_fraction=data_fraction,
                 strong_aug=strong_aug,
+                ssl_method=ssl_method,
             )
             _DATA_CACHE[cache_key] = data_obj
         self.train_loader, self.val_loader = data_obj.get_loaders()
 
-        # Linear LR scaling rule (BYOL): lr grows with batch size off a
-        # reference of BYOL_REF_BATCH, so larger batches stay well-tuned.
-        byol_lr = byol_base_lr * batch_size / BYOL_REF_BATCH
         loki_image_shape = (3, 64, 64) if dataset == "tiny_imagenet" else (3, 32, 32)
         model, ema, predictor = _build_or_get_models(
             dataset=dataset,
@@ -229,20 +245,43 @@ class FedClient(fl.client.NumPyClient):
             loki_num_kernels=self.loki_num_kernels,
             loki_image_shape=loki_image_shape,
             use_compile=self.use_compile,
+            ssl_method=ssl_method,
         )
-        self.trainer = SimpleBYOL(
-            online_encoder=model,
-            target_encoder=ema,
-            predictor=predictor,
-            lr=byol_lr,
-            moving_average_decay=0.99,
-            use_ema=True,
-            local_epochs=local_epochs,
-            dataset_len=len(self.train_loader),
-            total_rounds=total_rounds,
-            persist_models=self.use_compile,
-            use_async_save=self.use_async_save,
-        )
+        if ssl_method == "orchestra":
+            orchestra_lr = orchestra_base_lr * batch_size / 256
+            self.trainer = SimpleOrchestra(
+                online_encoder=model,
+                target_encoder=ema,
+                lr=orchestra_lr,
+                moving_average_decay=orchestra_ema,
+                local_epochs=local_epochs,
+                dataset_len=len(self.train_loader),
+                total_rounds=total_rounds,
+                persist_models=self.use_compile,
+                use_async_save=self.use_async_save,
+                n_local=orchestra_n_local,
+                n_global=orchestra_n_global,
+                memory_size=orchestra_memory_size,
+                temperature=orchestra_temperature,
+                proj_dim=ORCHESTRA_PROJ_DIM,
+            )
+        else:
+            # Linear LR scaling rule (BYOL): lr grows with batch size off a
+            # reference of BYOL_REF_BATCH, so larger batches stay well-tuned.
+            byol_lr = byol_base_lr * batch_size / BYOL_REF_BATCH
+            self.trainer = SimpleBYOL(
+                online_encoder=model,
+                target_encoder=ema,
+                predictor=predictor,
+                lr=byol_lr,
+                moving_average_decay=0.99,
+                use_ema=True,
+                local_epochs=local_epochs,
+                dataset_len=len(self.train_loader),
+                total_rounds=total_rounds,
+                persist_models=self.use_compile,
+                use_async_save=self.use_async_save,
+            )
 
     # ------------------------------------------------------------------ #
     # Flower interface
@@ -262,6 +301,13 @@ class FedClient(fl.client.NumPyClient):
         # any stale local copy.
         lam_cfg = float(config.get("lambda_k", -1.0))
         self.lambda_k = None if lam_cfg < 0 else lam_cfg
+
+        if self.ssl_method == "orchestra":
+            blob = config.get("global_centroids", b"")
+            n_g = int(config.get("n_global", 0) or 0)
+            d = int(config.get("proj_dim", 0) or 0)
+            if blob and n_g > 0 and d > 0:
+                self.trainer.set_global_centroids(unpack_centroids(blob, n_g, d))
 
         if not has_local or not selected_prev:
             # Case A: first round, or not selected last round — hard reset to global.
@@ -298,12 +344,18 @@ class FedClient(fl.client.NumPyClient):
             # mechanism. `parameters` is the global model this round, aligned
             # array-for-array with get_parameters() (same encoder+predictor split).
             out_params = self._apply_dp(parameters, out_params)
+        metrics = {"train_loss": train_loss, "cid": self.cid}
+        if self.ssl_method == "orchestra":
+            local_c = self.trainer.get_local_centroids()
+            metrics["local_centroids"] = pack_centroids(local_c)
+            metrics["n_local"] = int(local_c.shape[0])
+            metrics["proj_dim"] = int(local_c.shape[1])
         result = (
             out_params,
             len(self.train_loader.dataset),
             # Report the partition id so the (malicious) server can map Flower's
             # opaque ClientProxy ids to partitions and target a specific client.
-            {"train_loss": train_loss, "cid": self.cid},
+            metrics,
         )
         # The result above is CPU numpy and all state is on disk (_save_local), so
         # this trainer's GPU models/grad/optimizer are now disposable. The actor
@@ -411,8 +463,10 @@ class FedClient(fl.client.NumPyClient):
         # Name the arrays: get_parameters() is encoder state-dict floats followed by
         # predictor state-dict floats, so the same key order reproduces the layout.
         try:
-            keys = (self.trainer._sd_float_keys(self.trainer.online_encoder)
-                    + self.trainer._sd_float_keys(self.trainer.predictor))
+            keys = self.trainer._sd_float_keys(self.trainer.online_encoder)
+            pred = getattr(self.trainer, "predictor", None)
+            if pred is not None:
+                keys = keys + self.trainer._sd_float_keys(pred)
         except Exception:
             keys = [f"array[{i}]" for i in range(len(updates))]
         if len(keys) != len(updates):

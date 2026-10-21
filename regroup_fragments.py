@@ -15,7 +15,16 @@ from architectures import ResNet18Projv3
 # ---------------------------------------------------------------------------- #
 FRAG_DIR     = os.environ.get("FRAG_DIR", "fragments")
 CKPT         = os.environ.get("CKPT", "eval_model.pth")
-print(FRAG_DIR, CKPT)
+# Must match the federated encoder in CKPT so load_state_dict succeeds.
+# Both methods embed with the 512-d backbone (FedEMA paper identity; Orchestra
+# projector DBSCAN was worse -- 64% giant / median 6 vs backbone ~8% / median 10).
+# "orchestra" only switches the projector module that is loaded, plus the knobs
+# measured on that backbone (eps 0.93, k=8).
+SSL_METHOD   = os.environ.get("SSL_METHOD", "byol").lower()
+if SSL_METHOD == "fedema":
+    SSL_METHOD = "byol"
+assert SSL_METHOD in ("byol", "orchestra"), "SSL_METHOD must be 'byol'/'fedema' or 'orchestra'"
+_PROJECTOR   = "orchestra" if SSL_METHOD == "orchestra" else "byol"
 DATA_DIR     = R.DATA_DIR
 BATCH        = 512#4096
 
@@ -24,13 +33,18 @@ BLANK_STD    = 0.05          # per-fragment raw std below this == blank
 # expected cluster size -- ~99 rounds x f0 clean fragments per original. A round-
 # TRUNCATED arm (the round-cutoff test) has only ~6 rounds, so at K_NN=99 every
 # fragment's neighbourhood necessarily spans many originals and DBSCAN merges them
-# into a giant component. Env-overridable (default unchanged) so a truncated arm can
-# be re-run at a matched K_NN and the cutoff result separated from that artifact.
-K_NN         = int(os.environ.get("K_NN", "99"))#32   # neighbours per point in the kNN graph
+# into a giant component. Orchestra backbone: k=8 shrank the giant 166k→155k vs
+# k=99; FedEMA keeps 99. Env-overridable for truncated arms.
+K_NN         = int(os.environ.get("K_NN", "8" if SSL_METHOD == "orchestra" else "99"))
 MIN_PTS      = int(os.environ.get("MIN_PTS", "4"))    # min neighbours (incl. self) to be a core point
-EPS_SIM      = float(os.environ.get("EPS_SIM", "0.9"))  # cosine-sim threshold (where the giant component dissolves)
+# Cosine-sim threshold (where the giant component dissolves). Orchestra backbone
+# sits on a tight spherical cap (unrelated ~0.87, same-id ~0.94); 0.93 is the
+# plateau that matched FedEMA-style bins (median ~9–10, giant ~8%).
+_DEFAULT_EPS = "0.93" if SSL_METHOD == "orchestra" else "0.9"
+EPS_SIM      = float(os.environ.get("EPS_SIM", _DEFAULT_EPS))
 REFINE_CAP   = 99            # clusters above this are provably multi-original -> re-split
-REFINE_EPS   = (0.93,0.94,0.95, 0.96, 0.97, 0.98)
+REFINE_EPS   = (0.93, 0.94, 0.95, 0.96, 0.97, 0.98)
+print(FRAG_DIR, CKPT, SSL_METHOD, "backbone", f"eps={EPS_SIM} k={K_NN}")
 SEED         = R.SEED
 
 # --- sign canonicalisation (see _sign_reference) ---------------------------- #
@@ -205,7 +219,10 @@ def collect_usable():
 # ---------------------------------------------------------------------------- #
 def embed_all(items, device):
     sd = torch.load(CKPT, map_location="cpu")
-    net = ResNet18Projv3()
+    net = ResNet18Projv3(
+        emb_dim=512 if SSL_METHOD == "orchestra" else 2048,
+        projector=_PROJECTOR,
+    )
     net.load_state_dict({k[4:]: v for k, v in sd.items() if k.startswith("net.")})
     net = net.to(device).eval().requires_grad_(False)
     mean, std = _MEAN.to(device), _STD.to(device)
@@ -347,10 +364,13 @@ def main():
     print(f"device: {device}")
     items = collect_usable()
     canon_summary()
+    if not items:
+        print(f"nothing to cluster (0 fragments with std >= {BLANK_STD})")
+        return
     E = embed_all(items, device)
     idx, sim = knn_graph(E, K_NN, device)
     labels = refine(dbscan(idx, sim, EPS_SIM, MIN_PTS, device), E, device)
-    n_clusters = int(labels.max()) + 1
+    n_clusters = int(labels.max()) + 1 if labels.numel() else 0
     print(f"{n_clusters} clusters | noise {int((labels < 0).sum())}/{len(items)}")
     materialize(labels, items)
 

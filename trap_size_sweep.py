@@ -69,7 +69,7 @@ from pathlib import Path
 # Purpose of this run: USABLE per-point artefacts (peak-checkpointed encoder +
 # fragments) for offline reconstruction, on CIFAR-100. Earlier CIFAR-10 runs are
 # archived in dp_sweep_out/run1_8pt/ and dp_sweep_out/run2_cifar10/.
-Trap_size_grid = [128,256,512,1024,2048,4096]#[1e2,1e18, 1e20,1e22, 1e24, 1e26,1e30]
+Trap_size_grid = [128,256,512,1024,2048,4096, 10000]#[1e2,1e18, 1e20,1e22, 1e24, 1e26,1e30]
 DP_CLIP = 1e6      # public constant, above every observed |update| (~8.3e5) so the
                    # clip stays inactive and does not confound the noise axis
 DP_DELTA = 1e-5

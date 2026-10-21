@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 from torchvision import datasets, transforms as T
+from torchvision.transforms import functional as TF
+from PIL import ImageOps
 import matplotlib.pyplot as plt
 
 
@@ -43,6 +45,41 @@ class BYOLPairDataset(Dataset):
             return (v1, v2), label
         else:
             return v1, v2
+
+
+class _Solarization:
+    def __init__(self, p: float):
+        self.p = p
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            return ImageOps.solarize(img)
+        return img
+
+
+class OrchestraTripleDataset(Dataset):
+    """Official Orchestra views: (x1, x2, rotated-x3, angle in {0,1,2,3})."""
+
+    def __init__(self, base_dataset: Dataset, transform, transform_prime,
+                 keep_labels: bool = False):
+        self.base_dataset = base_dataset
+        self.transform = transform
+        self.transform_prime = transform_prime
+        self.keep_labels = keep_labels
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        img, label = self.base_dataset[idx]
+        x1 = self.transform(img)
+        x2 = self.transform_prime(img)
+        n = random.random()
+        angle = 0 if n <= 0.25 else 1 if n <= 0.5 else 2 if n <= 0.75 else 3
+        x3 = TF.rotate(self.transform(img), 90 * angle)
+        if self.keep_labels:
+            return (x1, x2, x3, angle), label
+        return x1, x2, x3, angle
 
 
 def _stratified_keep_indices(targets, fraction: float, seed: int):
@@ -111,6 +148,7 @@ class BYOLClientData:
         download: bool = True,
         data_fraction: float = 1.0,
         strong_aug: bool = False,
+        ssl_method: str = "byol",
     ):
         """
         Args:
@@ -127,11 +165,16 @@ class BYOLClientData:
                 needs download=True; see FedClient.
             data_fraction: fraction of training samples kept per class
                 (1.0 = full dataset, 0.5 = half; all classes stay represented).
-            strong_aug: when True, ~double the magnitude of every BYOL train
+            strong_aug: when True, ~double the magnitude of every train
                 augmentation (simulates clients that deliberately harden their
-                views against reconstruction). See _build_byol_transform.
+                views against reconstruction). See _build_byol_transform /
+                _build_orchestra_transforms.
+            ssl_method: "byol" (two independent views) or "orchestra"
+                (asymmetric views + a rotated third view).
         """
         assert 0 <= cid < num_clients, "cid must be in [0, num_clients-1]"
+        if ssl_method not in ("byol", "orchestra"):
+            raise ValueError(f"ssl_method must be 'byol' or 'orchestra', got {ssl_method!r}")
         self.non_iid = True
         self.classes_per_client = classes_per_client
         self.num_clients = num_clients
@@ -144,13 +187,19 @@ class BYOLClientData:
         self.data_fraction = data_fraction
         self.download = download
         self.strong_aug = strong_aug
+        self.ssl_method = ssl_method
 
         # Set global seeds for reproducibility of the *partitioning*.
         random.seed(seed)
         torch.manual_seed(seed)
 
-        # BYOL-style transforms (two views come from applying train_transform twice).
-        self.train_transform = self._build_byol_transform(train=True)
+        # BYOL: two views from applying train_transform twice.
+        # Orchestra: asymmetric view pair + a rotated third view.
+        if ssl_method == "orchestra":
+            self.train_transform, self.train_transform_prime = self._build_orchestra_transforms()
+        else:
+            self.train_transform = self._build_byol_transform(train=True)
+            self.train_transform_prime = None
         self.val_transform = self._build_byol_transform(train=False)
 
         self._maybe_setup()          # subclass hook (e.g. TinyImageNet download)
@@ -202,6 +251,41 @@ class BYOLClientData:
             T.ToTensor(),
             T.Normalize(mean=self.MEAN, std=self.STD),
         ])
+
+    def _build_orchestra_transforms(self):
+        """Official OrchestraTransform recipe, this repo's dataset mean/std.
+
+        View 1: crop (0.5,1), flip, jitter (0.4,0.4,0.2,0.1) p=0.8, gray p=0.2,
+        blur p=0.5. View 2: same but blur p=0.1 + solarization p=0.2.
+        strong_aug scales crop/jitter/gray/blur the same way as BYOL.
+        """
+        if self.strong_aug:
+            color_jitter = T.ColorJitter(0.8, 0.8, 0.4, 0.2)
+            crop_min_scale, grayscale_p, blur_p, blur_p_prime = 0.25, 0.4, 1.0, 0.2
+        else:
+            color_jitter = T.ColorJitter(0.4, 0.4, 0.2, 0.1)
+            crop_min_scale, grayscale_p, blur_p, blur_p_prime = 0.5, 0.2, 0.5, 0.1
+
+        def _ops(blur_prob, solarize_p=0.0):
+            ops = [
+                T.RandomResizedCrop(
+                    self.IMG_SIZE, scale=(crop_min_scale, 1.0),
+                    interpolation=T.InterpolationMode.BICUBIC,
+                ),
+                T.RandomHorizontalFlip(p=0.5),
+                T.RandomApply([color_jitter], p=0.8),
+                T.RandomGrayscale(p=grayscale_p),
+                T.RandomApply(
+                    [T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))],
+                    p=blur_prob,
+                ),
+            ]
+            if solarize_p > 0:
+                ops.append(_Solarization(p=solarize_p))
+            ops += [T.ToTensor(), T.Normalize(mean=self.MEAN, std=self.STD)]
+            return T.Compose(ops)
+
+        return _ops(blur_p), _ops(blur_p_prime, solarize_p=0.2)
 
     # ------------------------------------------------------------------ #
     # Non-IID shard partitioning (paper Alg.: label heterogeneity w/ shards)
@@ -314,16 +398,32 @@ class BYOLClientData:
             len(full_test), generator=gen_test,
         )
 
-        self.client_train_byol = BYOLPairDataset(
-            base_dataset=Subset(full_train, train_indices),
-            transform=self.train_transform,
-            keep_labels=self.keep_labels,
-        )
-        self.client_val_byol = BYOLPairDataset(
-            base_dataset=Subset(full_test, val_indices),
-            transform=self.val_transform,
-            keep_labels=self.keep_labels,
-        )
+        train_base = Subset(full_train, train_indices)
+        val_base = Subset(full_test, val_indices)
+        if self.ssl_method == "orchestra":
+            self.client_train_byol = OrchestraTripleDataset(
+                base_dataset=train_base,
+                transform=self.train_transform,
+                transform_prime=self.train_transform_prime,
+                keep_labels=self.keep_labels,
+            )
+            self.client_val_byol = OrchestraTripleDataset(
+                base_dataset=val_base,
+                transform=self.val_transform,
+                transform_prime=self.val_transform,
+                keep_labels=self.keep_labels,
+            )
+        else:
+            self.client_train_byol = BYOLPairDataset(
+                base_dataset=train_base,
+                transform=self.train_transform,
+                keep_labels=self.keep_labels,
+            )
+            self.client_val_byol = BYOLPairDataset(
+                base_dataset=val_base,
+                transform=self.val_transform,
+                keep_labels=self.keep_labels,
+            )
 
     def _create_dataloaders(self) -> Tuple[DataLoader, DataLoader]:
         train_loader = DataLoader(

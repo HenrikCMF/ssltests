@@ -12,10 +12,11 @@ control:
   1. Load CIFAR-100 (downloaded on first run).
   2. Split 99.9/0.1 into train/test.
   3. PRECOMPUTE, once and in parallel, `NUM_PERTURB` *bit-exact torchvision/PIL*
-     perturbations per original (the same transform the federated clients use in
-     dataloader._build_byol_transform, minus the final ToTensor/Normalize which is
-     applied identically on the GPU at train time). Cached to a uint8 memmap so
-     training just reads it -- no per-step augmentation, which was the bottleneck.
+     perturbations per original. The recipe is taken from the CIFAR-10 client
+     (dataloader.CIFAR10BYOLClientData) that produced fragments/, minus the
+     final ToTensor/Normalize which is applied identically on the GPU at train
+     time. Cached to a uint8 memmap so training just reads it -- no per-step
+     augmentation, which was the bottleneck.
   4. Tile the views into a square grid and push it through a CNN ending in a linear
      layer with one neuron per ground-truth pixel-channel (3*32*32), reshaped back.
   5. Train with an SSIM loss (1 - SSIM). Mixed precision + channels_last.
@@ -31,7 +32,14 @@ import math
 import os
 import random
 import time
-from multiprocessing import Pool
+import multiprocessing as mp
+
+# Must be set before importing torch / matplotlib. Torch's OpenMP runtime is
+# not fork-safe (Pool workers hang in futex_do_wait at 0% CPU). Spawn workers
+# re-import this module, so Agg avoids a matplotlib display lock too.
+os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import numpy as np
 import torch
@@ -39,6 +47,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
+
+from dataloader import BYOLClientData, CIFAR10BYOLClientData
 
 # ---------------------------------------------------------------------------- #
 # Config
@@ -122,6 +132,10 @@ AMP           = True         # mixed precision
 #            steps there, and the updated weights are copied back to the replica. Only
 #            cuda:0's model is ever checkpointed/evaluated.
 COMPILE       = True
+# CUDA graphs + a display-attached GPU (this 5090 drives Wayland) is how
+# epoch 65 died: cudaErrorLaunchTimeout, the driver's ~2s watchdog. Compiled
+# kernels stay; graphs that capture a long fused launch do not.
+COMPILE_CUDA_GRAPHS = False
 PREFETCH      = True
 # DUAL_GPU measured a NET LOSS on this box (RTX 5090 + RTX 4060 Ti): the 4060 Ti is ~6x
 # slower and sits on PCIe 4.0 x8, so the per-step grad+weight sync (~308 MB ~19 ms) plus
@@ -131,7 +145,8 @@ PREFETCH      = True
 DUAL_GPU      = False
 GPU1_FRAC     = 0.20         # fraction of each batch's originals sent to the weaker GPU1 (if DUAL_GPU)
 PRECOMPUTE_WORKERS = 24
-FORCE_PRECOMPUTE = True     # ignore cache and regenerate the views
+FORCE_PRECOMPUTE = False    # reuse recon_cache; True regenerates the 30.7 GB views
+RESUME        = True        # continue from train_state (or best.pt) after a crash
 SEED          = 12345
 MODEL         = "settr"      # "settr" (view=token transformer), "set", or "cnn"
 OUT_DIR       = "reconstruction_out"
@@ -203,16 +218,27 @@ def dp_noise_to_leak_noise(sigma, m_fired, num_clients=1):
 # distribution the real clients produce. Strong/weak views and checkpoints are
 # kept in separate files (via _AUG_TAG) so flipping this never clobbers the other.
 STRONG_AUG    = False
+# Client SSL-augmentation recipe. MUST match FedEMA_run.SSL_METHOD of the
+# federated run whose fragments will be inverted. fragments/ was produced by
+# Orchestra (output.log: "[SSL] method=orchestra"), so the default is
+# "orchestra": dataloader._build_orchestra_transforms, and pil_views samples
+# only the two views that hit the ONLINE encoder (x2, x3) -- x1 is target-only
+# and never leaks. "byol" is the CIFAR-style BYOL pair. Caches/ckpts are tagged
+# so flipping this never clobbers the other.
+SSL_METHOD    = "orchestra"  # "byol" or "orchestra"
+assert SSL_METHOD in ("byol", "orchestra"), "SSL_METHOD must be 'byol' or 'orchestra'"
 _RES_TAG      = (f"_up{IMG_SIZE}" if UPSCALE else              # keep each mode's ckpt/cache
                  f"_down{IMG_SIZE}" if DOWNSCALE else            # files separate & non-clobbering
                  f"_svhn{IMG_SIZE}" if SVHN else "")
 _LOSS_TAG     = "_lpips" if LPIPS_LOSS else ""                  # keep LPIPS-trained ckpts separate
 _AUG_TAG      = "_strong" if STRONG_AUG else ""                # strong-aug views/ckpts kept separate
-CKPT_NAME     = ("best_leak" if LEAK_VIEWS else "best") + _RES_TAG + _LOSS_TAG + _AUG_TAG + ".pt"  # don't clobber others
+_SSL_TAG      = "_orchestra" if SSL_METHOD == "orchestra" else ""
+CKPT_NAME     = ("best_leak" if LEAK_VIEWS else "best") + _RES_TAG + _LOSS_TAG + _AUG_TAG + _SSL_TAG + ".pt"  # don't clobber others
+STATE_NAME    = "train_state" + _RES_TAG + _LOSS_TAG + _AUG_TAG + _SSL_TAG + ".pt"  # full resume (opt/sched/epoch)
 
-# CIFAR normalization (must match the federated pipeline exactly).
-CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
-CIFAR_STD  = (0.2470, 0.2435, 0.2616)
+# CIFAR-10 normalization (must match the federated pipeline that produced fragments/).
+CIFAR_MEAN = CIFAR10BYOLClientData.MEAN
+CIFAR_STD  = CIFAR10BYOLClientData.STD
 
 assert GRID * GRID == NUM_PERTURB, "NUM_PERTURB must be a perfect square == GRID*GRID"
 
@@ -220,23 +246,46 @@ assert GRID * GRID == NUM_PERTURB, "NUM_PERTURB must be a perfect square == GRID
 # as a uint8 PIL image (same pixels the client feeds ToTensor) and do /255 +
 # normalize on the GPU -- mathematically identical to ToTensor()+Normalize().
 #
-# STRONG_AUG (set above) mirrors dataloader.BYOLClientData's toggle exactly, along
-# the same knobs it scales for the CIFAR/CIFAR-100 client path: crop min-scale
-# 0.2->0.1, ColorJitter (0.8,0.8,0.8,0.2)->(1.6,1.6,1.6,0.4), grayscale p 0.2->0.4.
-# Horizontal flip stays at p=0.5. (No GaussianBlur in either mode here, matching
-# this pipeline's existing CIFAR-style transform.)
-if STRONG_AUG:
-    _COLOR_JITTER = T.ColorJitter(1.6, 1.6, 1.6, 0.4)
-    _CROP_MIN_SCALE, _GRAYSCALE_P = 0.1, 0.4
-else:
-    _COLOR_JITTER = T.ColorJitter(0.8, 0.8, 0.8, 0.2)
-    _CROP_MIN_SCALE, _GRAYSCALE_P = 0.2, 0.2
-PRECOMPUTE_TF = T.Compose([
-    T.RandomResizedCrop(IMG_SIZE, scale=(_CROP_MIN_SCALE, 1.0)),
-    T.RandomHorizontalFlip(),
-    T.RandomApply([_COLOR_JITTER], p=0.8),
-    T.RandomGrayscale(p=_GRAYSCALE_P),
-])
+# Built from CIFAR10BYOLClientData's own methods (the class FedEMA_run used for
+# fragments/), not a reimplementation, so the recipe cannot drift. STRONG_AUG
+# and SSL_METHOD are the same knobs the client saw. Orchestra always includes
+# GaussianBlur + (on view 2) solarization; CIFAR-10 BYOL does not blur.
+
+
+def _client_tf_host():
+    """CIFAR-10 client transform knobs without loading the dataset.
+
+    fragments/ is CIFAR-10 Orchestra, so the inverter trains on that recipe even
+    when the SOURCE images are Tiny ImageNet downscaled to IMG_SIZE.
+    """
+    h = BYOLClientData.__new__(BYOLClientData)
+    h.strong_aug = STRONG_AUG
+    h.IMG_SIZE = IMG_SIZE
+    h.USE_BLUR = CIFAR10BYOLClientData.USE_BLUR
+    h.BLUR_KERNEL = CIFAR10BYOLClientData.BLUR_KERNEL
+    h.MEAN = CIFAR10BYOLClientData.MEAN
+    h.STD = CIFAR10BYOLClientData.STD
+    return h
+
+
+def _strip_to_pil(tf: T.Compose) -> T.Compose:
+    """Drop trailing ToTensor/Normalize; GPU-side GridMaker.norm does that math."""
+    return T.Compose([
+        op for op in tf.transforms
+        if not isinstance(op, (T.ToTensor, T.Normalize))
+    ])
+
+
+def _build_precompute_transforms():
+    """PIL-only client views. Returns (tf, tf_prime); tf_prime is None for BYOL."""
+    h = _client_tf_host()
+    if SSL_METHOD == "orchestra":
+        tf, tf_prime = h._build_orchestra_transforms()
+        return _strip_to_pil(tf), _strip_to_pil(tf_prime)
+    return _strip_to_pil(h._build_byol_transform(train=True)), None
+
+
+PRECOMPUTE_TF, PRECOMPUTE_TF_PRIME = _build_precompute_transforms()
 loss_func = nn.MSELoss()
 
 def get_device() -> torch.device:
@@ -273,17 +322,33 @@ def pil_views(orig_hwc: np.ndarray, n_pert: int, seed: int) -> np.ndarray:
         img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)   # best-quality LANCZOS resize first
     out = np.empty((n_pert, 3, IMG_SIZE, IMG_SIZE), dtype=np.uint8)
     for k in range(n_pert):
-        aug = PRECOMPUTE_TF(img)                       # PIL RGB image
+        if SSL_METHOD == "orchestra":
+            # LOKI reads the transmitted ONLINE-encoder update. Orchestra's train
+            # step runs x2 (transform_prime) and x3 (rotated transform) through
+            # online_encoder; x1 is target-only and never leaks. Mix 1:1, with
+            # x3's 90-degree angle sampled as in OrchestraTripleDataset.
+            if random.randrange(2) == 0:
+                aug = PRECOMPUTE_TF_PRIME(img)
+            else:
+                aug = PRECOMPUTE_TF(img)
+                n = random.random()
+                angle = 0 if n <= 0.25 else 1 if n <= 0.5 else 2 if n <= 0.75 else 3
+                aug = T.functional.rotate(aug, 90 * angle)
+        else:
+            aug = PRECOMPUTE_TF(img)                   # PIL RGB image
         out[k] = np.asarray(aug, dtype=np.uint8).transpose(2, 0, 1)
     return out
 
 
-# Parallel precompute: workers write disjoint rows of the memmap directly.
+# Parallel precompute: spawn workers write disjoint rows of the memmap.
+# Spawn (not fork): importing torch starts an OpenMP thread pool, and forking
+# afterwards deadlocks every worker on a mutex — 0% CPU, 0% GPU, unkillable
+# orphans once the parent is SIGTERM'd.
 _G = {}
 
 
-def _init_worker(raw, train_idx, mmap_path, shape):
-    _G["raw"] = raw
+def _init_worker(raw_path, train_idx, mmap_path, shape):
+    _G["raw"] = np.load(raw_path, mmap_mode="r")
     _G["tidx"] = train_idx
     _G["mm"] = np.memmap(mmap_path, dtype=np.uint8, mode="r+", shape=shape)
 
@@ -292,6 +357,16 @@ def _precompute_one(j: int) -> int:
     orig = _G["raw"][_G["tidx"][j]]                    # [H,W,3] uint8 (32 CIFAR/SVHN, 64 TinyIN)
     _G["mm"][j] = pil_views(orig, NUM_PERTURB, seed=SEED * 1_000_003 + j)
     return j
+
+
+def _raw_npy_path(raw: np.ndarray) -> str:
+    """On-disk originals for spawn workers to mmap (do not pickle a 1GB array)."""
+    if DOWNSCALE:
+        return os.path.join(CACHE_DIR, "tiny_imagenet_train_raw.npy")
+    path = os.path.join(CACHE_DIR, f"source_raw{_RES_TAG}.npy")
+    if not os.path.exists(path) or os.path.getsize(path) < int(raw.nbytes):
+        np.save(path, np.ascontiguousarray(raw))
+    return path
 
 
 # ---------------------------------------------------------------------------- #
@@ -309,6 +384,8 @@ def _cache_meta():
         m["svhn"], m["source"] = True, "svhn"
     if STRONG_AUG:  # conditional so existing weak-aug caches keep validating unchanged
         m["strong_aug"] = True
+    if SSL_METHOD == "orchestra":  # conditional so existing BYOL caches keep validating
+        m["ssl_method"] = "orchestra"
     return m
 
 
@@ -362,8 +439,8 @@ def build_view_cache(device):
         train_idx = train_idx[:TRAIN_SUBSET]
     n_train = len(train_idx)
 
-    mmap_path = os.path.join(CACHE_DIR, f"train_views{_RES_TAG}{_AUG_TAG}.u8")
-    meta_path = os.path.join(CACHE_DIR, f"train_views{_RES_TAG}{_AUG_TAG}.json")
+    mmap_path = os.path.join(CACHE_DIR, f"train_views{_RES_TAG}{_AUG_TAG}{_SSL_TAG}.u8")
+    meta_path = os.path.join(CACHE_DIR, f"train_views{_RES_TAG}{_AUG_TAG}{_SSL_TAG}.json")
     shape = (n_train, NUM_PERTURB, 3, IMG_SIZE, IMG_SIZE)
     meta = _cache_meta(); meta["n_train"] = n_train
 
@@ -374,17 +451,23 @@ def build_view_cache(device):
         print(f"using cached views: {mmap_path} ({np.prod(shape)/1e9:.1f} GB)")
     else:
         print(f"precomputing {n_train}x{NUM_PERTURB} PIL views "
-              f"({np.prod(shape)/1e9:.1f} GB) on {PRECOMPUTE_WORKERS} workers...")
+              f"({np.prod(shape)/1e9:.1f} GB) on {PRECOMPUTE_WORKERS} spawn workers...",
+              flush=True)
         mm = np.memmap(mmap_path, dtype=np.uint8, mode="w+", shape=shape)
         del mm                                         # workers reopen in r+ mode
+        raw_path = _raw_npy_path(raw)
         t0 = time.time()
-        with Pool(PRECOMPUTE_WORKERS, initializer=_init_worker,
-                  initargs=(raw, train_idx, mmap_path, shape)) as pool:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(PRECOMPUTE_WORKERS, initializer=_init_worker,
+                      initargs=(raw_path, train_idx, mmap_path, shape)) as pool:
             done = 0
             for _ in pool.imap_unordered(_precompute_one, range(n_train), chunksize=16):
                 done += 1
-                if done % 2000 == 0 or done == n_train:
-                    print(f"  {done}/{n_train}  ({time.time()-t0:.0f}s)", flush=True)
+                if done == 1 or done % 500 == 0 or done == n_train:
+                    elapsed = time.time() - t0
+                    eta = (n_train - done) * elapsed / max(done, 1)
+                    print(f"  {done}/{n_train}  ({elapsed:.0f}s elapsed, ~{eta:.0f}s left)",
+                          flush=True)
         json.dump(meta, open(meta_path, "w"))
         print(f"precompute done in {time.time()-t0:.0f}s")
 
@@ -879,6 +962,79 @@ def save_preview(model, gm, test_views, test_orig, device, path, max_show=8):
     fig.tight_layout(); fig.savefig(path, dpi=120, bbox_inches="tight"); plt.close(fig)
 
 
+def _infer_resume_epoch() -> int:
+    """Next epoch after the latest preview_epochXXX.png (crash left those, not train_state)."""
+    import glob
+    ns = []
+    for p in glob.glob(os.path.join(OUT_DIR, "preview_epoch*.png")):
+        try:
+            ns.append(int(os.path.basename(p)[len("preview_epoch"):-4]))
+        except ValueError:
+            pass
+    return (max(ns) + 1) if ns else 1
+
+
+def save_train_state(path, epoch, model, opt, scaler, sched, best):
+    torch.save({
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "opt": opt.state_dict(),
+        "scaler": scaler.state_dict(),
+        "sched": sched.state_dict(),
+        "best": best,
+        "rng_py": random.getstate(),
+        "rng_torch": torch.get_rng_state(),
+        "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }, path)
+
+
+def try_resume(model, opt, scaler, sched, device):
+    """Returns (start_epoch, best, source). source is 'state', 'ckpt', or None."""
+    if not RESUME:
+        return 1, float("-inf"), None
+    state_path = os.path.join(OUT_DIR, STATE_NAME)
+    ckpt_path = os.path.join(OUT_DIR, CKPT_NAME)
+    if os.path.exists(state_path):
+        st = torch.load(state_path, map_location=device, weights_only=False)
+        model.load_state_dict(st["model"])
+        opt.load_state_dict(st["opt"])
+        scaler.load_state_dict(st["scaler"])
+        sched.load_state_dict(st["sched"])
+        if st.get("rng_py") is not None:
+            random.setstate(st["rng_py"])
+        if st.get("rng_torch") is not None:
+            torch.set_rng_state(st["rng_torch"])
+        if st.get("rng_cuda") is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(st["rng_cuda"])
+            except Exception:
+                pass
+        nxt = int(st["epoch"]) + 1
+        print(f"RESUME {state_path} (completed epoch {st['epoch']}) -> start epoch {nxt}")
+        return nxt, st["best"], "state"
+    if os.path.exists(ckpt_path):
+        model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+        nxt = _infer_resume_epoch()
+        for _ in range(nxt - 1):
+            sched.step()
+        print(f"RESUME {ckpt_path} weights, LR at epoch {nxt} "
+              f"(no optimizer state — Adam moments reset; next crash will have {STATE_NAME})")
+        return nxt, float("-inf"), "ckpt"
+    return 1, float("-inf"), None
+
+
+def compile_model(m):
+    if not COMPILE:
+        return m
+    if not COMPILE_CUDA_GRAPHS:
+        try:
+            import torch._inductor.config as _ic
+            _ic.triton.cudagraphs = False
+        except Exception:
+            pass
+    return torch.compile(m, dynamic=True)
+
+
 def train_forward(tmodel, gm, v_u8, gt_u8, dev):
     """norm views + originals, autocast forward through (maybe compiled) tmodel, recon_loss.
     Returns the shard's mean loss on `dev`. Shared by the primary and the dual-GPU replica."""
@@ -891,12 +1047,17 @@ def train_forward(tmodel, gm, v_u8, gt_u8, dev):
 
 def main():
     torch.manual_seed(SEED)
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    # CPU cache first (Pool uses spawn, so CUDA init here would be fine too).
+    train_views, train_orig, test_views, test_orig = build_view_cache(torch.device("cpu"))
+
     torch.backends.cudnn.benchmark = True
     device = get_device()
     dev0 = torch.device("cuda:0") if device.type == "cuda" else device
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-    train_views, train_orig, test_views, test_orig = build_view_cache(dev0)
+    train_orig = train_orig.to(dev0, non_blocking=True)
+    test_views = test_views.to(dev0, non_blocking=True)
+    test_orig = test_orig.to(dev0, non_blocking=True)
     n_train = train_views.shape[0]
     print(f"train originals: {n_train} | test originals: {test_views.shape[0]} | "
           f"{NUM_PERTURB} views each, grid {GRID}x{GRID}")
@@ -927,11 +1088,20 @@ def main():
     else:
         dev1, gm1, model1, n1, n0 = None, None, None, 0, BATCH_SIZE
 
-    train_model = torch.compile(model) if COMPILE else model
-    train_model1 = torch.compile(model1) if (COMPILE and dual) else model1
+    start_epoch, best, resumed = try_resume(model, opt, scaler, sched, dev0)
+    if dual and resumed is not None:
+        with torch.no_grad():
+            for p1, p0 in zip(model1.parameters(), model.parameters()):
+                p1.copy_(p0.to(dev1))
+            for b1, b0 in zip(model1.buffers(), model.buffers()):
+                b1.copy_(b0.to(dev1))
+
+    train_model = compile_model(model)
+    train_model1 = compile_model(model1) if dual else model1
 
     print(f"model: {MODEL} | params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M | "
           f"device: {dev0} | amp: {AMP} | batch: {BATCH_SIZE} | compile: {COMPILE} | prefetch: {PREFETCH}")
+    print(f"SSL_METHOD={SSL_METHOD} | STRONG_AUG={STRONG_AUG} -> {CKPT_NAME}")
     if dual:
         print(f"DUAL_GPU on -> split {n0} originals on {dev0} + {n1} on {dev1} "
               f"(GPU1_FRAC={GPU1_FRAC}); size-weighted grad combine, single optimizer on {dev0}")
@@ -939,9 +1109,17 @@ def main():
         print(f"LEAK_VIEWS on -> training on real-fragment input space "
               f"(noise={LEAK_NOISE}, contam_p={LEAK_CONTAM_P}) -> {CKPT_NAME}")
 
-    random.seed(SEED)            # reproducible per-step view-count sampling (make_epoch_plan)
-    best = float("-inf")         # works for both "higher SSIM" and "lower LPIPS" (stored negated)
-    for epoch in range(1, EPOCHS + 1):
+    if resumed != "state":
+        random.seed(SEED)        # train_state already restored rng; don't clobber it
+    if resumed == "ckpt":
+        test_ssim, test_lpips = evaluate(model, gm, test_views, test_orig, dev0)
+        best = -test_lpips if LPIPS_LOSS else test_ssim
+        print(f"resumed-best from {CKPT_NAME}: test SSIM {test_ssim:.4f}"
+              + (f" LPIPS {test_lpips:.4f}" if LPIPS_LOSS else ""))
+    if start_epoch > EPOCHS:
+        print(f"already completed {EPOCHS} epochs (resume start {start_epoch}); nothing to do")
+        return
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         if dual:
             model1.train()
@@ -1002,14 +1180,21 @@ def main():
             line += f" | test LPIPS {test_lpips:.4f}"
         print(line + f" | {time.time()-t0:.1f}s", flush=True)
 
-        save_preview(model, gm, test_views, test_orig, dev0,
-                     os.path.join(OUT_DIR, f"preview_epoch{epoch:03d}.png"))
         # Select the checkpoint on the trained objective: lowest LPIPS (stored as its
         # negative so "> best" still means "better") in LPIPS mode, else highest SSIM.
         score = -test_lpips if LPIPS_LOSS else test_ssim
         if score > best:
             best = score
             torch.save(model.state_dict(), os.path.join(OUT_DIR, CKPT_NAME))
+        # Persist optimizer/epoch BEFORE preview so a later CUDA watchdog kill
+        # (display-attached 5090) still resumes the just-finished epoch.
+        save_train_state(os.path.join(OUT_DIR, STATE_NAME),
+                         epoch, model, opt, scaler, sched, best)
+        save_preview(model, gm, test_views, test_orig, dev0,
+                     os.path.join(OUT_DIR, f"preview_epoch{epoch:03d}.png"))
+        if dev0.type == "cuda":
+            torch.cuda.synchronize()
+            time.sleep(0.05)       # yield to the Wayland compositor on this GPU
 
     best_str = f"LPIPS {-best:.4f}" if LPIPS_LOSS else f"SSIM {best:.4f}"
     print(f"done. best test {best_str} | checkpoints + previews in {OUT_DIR}/")
